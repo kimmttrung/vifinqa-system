@@ -1,0 +1,312 @@
+# %% [markdown]
+# # ViFinQA — Stage E : LLM Planner (Program-of-Thought)
+#
+# **Accelerator : GPU T4 ×2** · **Internet : ON** · thời gian ~2,5–4 giờ
+#
+# | Vào | Ra |
+# |---|---|
+# | `vifinqa-bundle` (artifacts + questions + src + submission.zip) | `llm_patch.jsonl` · `llm_log.jsonl` |
+#
+# Mang `llm_patch.jsonl` về local rồi:
+# `python scripts/apply_llm.py --sub out/v4 --patch llm_patch.jsonl --out out/v5`
+#
+# ---
+# ## Nguyên tắc bất di bất dịch: LLM sinh CODE, executor sinh SỐ
+# LLM không bao giờ được viết con số vào `answer`. Mọi giá trị đều do sandbox
+# chạy `pandas_query` trên CSV mà ra. Đây vừa là lá chắn chống hallucination,
+# vừa là điều kiện để Execution Accuracy không bao giờ tụt.
+#
+# ## Vì sao đưa TẤT CẢ 1.012 câu vào LLM
+#
+# | | Answer Accuracy |
+# |---|---|
+# | Mentor · LLM + retrieved evidence (k=10) | **64,0 %** |
+# | Mentor · LLM + oracle evidence | 87,0 % |
+# | **Ta · rule thuần (đo trên leaderboard 17/08)** | **24,1 %** |
+#
+# Retrieval của ta có recall **0,605** — không kém mentor bao nhiêu. Nên khoảng
+# cách 24 % vs 64 % **không phải do retrieval**, mà do rule chỉ mã hoá được công
+# thức đóng. Đường tất định đang là cái **trần**, không phải cái nền.
+#
+# Rule không bị bỏ, nó đổi vai:
+# * CSV đã chuẩn hoá số sẵn → triệt nhóm lỗi parse (mentor: 9,3 % Technical +
+#   phần lớn 54,7 % Numerical Extraction)
+# * Sandbox verify → trọng tài duy nhất quyết định code có được nhận hay không
+# * `rule_answer` đi kèm mỗi bản vá → `apply_llm.py` báo cờ khi LLM lệch >2 %
+#
+# ## Vì sao AWQ 4-bit là bắt buộc trên T4×2
+# fp16 14B = 28 GB; T4×2 = 30 GB tổng ⇒ TP=2 còn ~2 GB cho KV cache, nghẹt ngay.
+# AWQ 4-bit ≈ 9 GB ⇒ mỗi T4 giữ ~4,5 GB, còn ~10 GB KV cache.
+# **sm75 không có Marlin kernel** nên vLLM tự rơi về AWQ GEMM thường: chậm hơn
+# nhưng chạy được. `enforce_eager=True` để tránh lỗi CUDA-graph capture trên Turing.
+
+# %%
+import json
+import os
+import re
+import sys
+import time
+import zipfile
+from collections import Counter
+from pathlib import Path
+
+import pandas as pd
+
+T_START = time.time()
+IN_KAGGLE = Path("/kaggle/input").exists()
+OUT = Path("/kaggle/working") if IN_KAGGLE else Path("out/llm")
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+def log(msg: str) -> None:
+    print(f"[{time.time()-T_START:7.1f}s] {msg}", flush=True)
+
+
+def find(marker: str) -> Path:
+    roots = [Path("/kaggle/input")] if IN_KAGGLE else [Path.cwd(), Path.cwd().parent]
+    for root in roots:
+        if not root.exists():
+            continue
+        if (root / marker).exists():
+            return root
+        for d in range(1, 6):
+            hits = list(root.glob("/".join(["*"] * d) + "/" + marker))
+            if hits:
+                return hits[0].parents[len(Path(marker).parts) - 1]
+    raise FileNotFoundError(f"Không thấy {marker}")
+
+
+BUNDLE = find("src/qparse.py")
+sys.path.insert(0, str(BUNDLE / "src"))
+os.environ.setdefault("VIFINQA_ARTIFACTS",
+                      str(find("artifacts/table_meta.parquet") / "artifacts"))
+
+from execute import run_query                # noqa: E402
+from qparse import parse_question            # noqa: E402
+
+# ── giải nén submission.zip: 1 file thay vì 4.900 file lẻ (Kaggle rất chậm với
+#    dataset nhiều file nhỏ) ──
+BASE = Path("/kaggle/working/base") if IN_KAGGLE else Path("out/v4")
+if IN_KAGGLE:
+    zpath = next(Path("/kaggle/input").rglob("submission.zip"))
+    BASE.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zpath) as z:
+        z.extractall(BASE)
+    log(f"giải nén {zpath} → {BASE}")
+
+records = json.loads((BASE / "submission.json").read_text(encoding="utf-8"))
+log(f"bundle {BUNDLE}  ·  base {BASE}  ·  {len(records)} câu")
+
+# %% [markdown]
+# ## 1 — Chọn phạm vi
+
+# %%
+LLM_SCOPE = "all"        # "all" | "hard"  ("hard" để chạy ablation so sánh)
+
+_HARD_OPS = {"RATIO", "GROWTH", "MEDIAN", "CONDITIONAL", "COUNT", "AVERAGE", "SUPERLATIVE"}
+_HARD_UNITS = {"percent", "pp", "times", "year", "count"}
+
+targets = []
+for r in records:
+    ir = parse_question(r["id"], r["question"])
+    hard = bool(_HARD_OPS & set(ir.ops)) or ir.unit_kind in _HARD_UNITS or ir.tier >= 3
+    if (LLM_SCOPE == "all" or hard) and r["evidence"]:
+        targets.append((r, ir))
+
+log(f"đưa vào LLM: {len(targets)}/{len(records)}  (scope={LLM_SCOPE})")
+log(f"  theo tier : {dict(sorted(Counter(ir.tier for _, ir in targets).items()))}")
+log(f"  theo đơn vị: {dict(Counter(ir.unit_kind for _, ir in targets).most_common())}")
+log(f"  df/câu     : trung bình "
+    f"{sum(len(r['evidence']) for r, _ in targets)/max(len(targets),1):.1f}")
+
+# %% [markdown]
+# ## 2 — Prompt PoT
+#
+# Bốn hợp đồng theo mentor, nhưng **Data Contract đã được đơn giản hoá**: Stage G
+# của ta chuẩn hoá số ngay khi ghi CSV (`1.234.567`→`1234567.0`, `(162.105)`→
+# `-162105.0`). Mô hình không còn phải tự parse dấu chấm/ngoặc kiểu Việt.
+#
+# Preview dùng **nhãn dòng + tên cột đã làm phẳng** (`tai_ngay_31_12_2022trieu_vnd`).
+# Đây chính là "cell grounding" mà mentor gọi là trọng tâm: cho mô hình thấy rõ
+# tiền tố hàng/cột thay vì bắt nó đoán.
+
+# %% [markdown]
+# Prompt sống trong `src/prompt.py` chứ không phải trong notebook, để **test
+# được ở local mà không cần GPU**. Nếu để trong notebook thì lỗi prompt chỉ lộ ra
+# sau khi đã nạp model 14B và chạy 20 phút.
+#
+# Đã đo ở local trên cả 1.012 câu:
+# * dòng chứa đáp án vào được preview: `head(30)` **97,0 %** → chọn theo câu hỏi **98,2 %**
+# * độ dài prompt: trung vị **2.241** token · p90 **4.354** · **max 8.825**
+#
+# Max vượt `max_model_len` 8.192 ⇒ `build_prompt_fitted()` thu nhỏ dần (giảm số
+# dòng preview trước, mới bớt bảng sau) thay vì bỏ trắng câu.
+
+# %%
+from prompt import SYSTEM, build_prompt, build_prompt_fitted  # noqa: E402
+
+_rec0, _ir0 = targets[0]
+_demo = build_prompt(_rec0, _ir0, BASE)
+log(f"prompt mẫu ({len(_demo)} ký tự):\n{'-'*72}\n{_demo[:1800]}\n{'-'*72}")
+
+# %% [markdown]
+# ## 3 — vLLM: Qwen 14B AWQ, tensor-parallel 2
+
+# %%
+MODEL = os.environ.get("VIFINQA_LLM", "Qwen/Qwen2.5-14B-Instruct-AWQ")
+MAX_LEN = 8192
+
+from vllm import LLM, SamplingParams      # noqa: E402
+
+log(f"nạp {MODEL} (AWQ, TP=2, dtype=half) …")
+llm = LLM(model=MODEL, dtype="half", quantization="awq", tensor_parallel_size=2,
+          max_model_len=MAX_LEN, gpu_memory_utilization=0.90,
+          enforce_eager=True, trust_remote_code=True)
+tok = llm.get_tokenizer()
+log("mô hình sẵn sàng")
+
+# %% [markdown]
+# ## 4 — Sinh code → thực thi → chỉ giữ câu chạy ra số
+#
+# `temperature=0` lượt 1. Câu nào code lỗi thì thử lại 2 lượt `temperature=0.35`.
+# Self-consistency rẻ hơn nhiều so với mất trắng câu đó, và **executor là trọng
+# tài** nên retry không bao giờ làm hỏng một đáp án đã đúng.
+
+# %%
+_CODE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.S)
+
+
+def extract_code(text: str) -> str:
+    m = _CODE_RE.search(text)
+    return (m.group(1) if m else text).strip()
+
+
+_frame_cache: dict[str, pd.DataFrame] = {}
+
+
+def frames_for(rec: dict) -> dict:
+    out = {}
+    for e in rec["evidence"]:
+        f = BASE / e["csv_path"]
+        if not f.exists():
+            continue
+        if e["csv_path"] not in _frame_cache:
+            _frame_cache[e["csv_path"]] = pd.read_csv(f)
+        out[e["variable"]] = _frame_cache[e["csv_path"]].copy()
+    return out
+
+
+def n_tokens(s: str) -> int:
+    return len(tok(s).input_ids)
+
+
+def build_chat(rec, ir) -> tuple[str, list[dict], str]:
+    """→ (chat prompt, evidence THỰC SỰ được đưa vào, cách thu nhỏ).
+
+    `evidence` trả về phải dùng làm frames cho executor: nếu prompt bị bớt bảng
+    mà runtime vẫn cấp đủ df thì mô hình có thể tham chiếu dfN nó chưa thấy;
+    ngược lại nếu runtime thiếu df mà prompt có thì code chạy lỗi KeyError.
+    """
+    body, ev, how = build_prompt_fitted(rec, ir, BASE, n_tokens, MAX_LEN - 950)
+    chat = tok.apply_chat_template(
+        [{"role": "system", "content": SYSTEM}, {"role": "user", "content": body}],
+        tokenize=False, add_generation_prompt=True)
+    return chat, ev, how
+
+
+patched, pending, journal = {}, list(targets), []
+shrunk = Counter()
+for attempt, temp in enumerate([0.0, 0.35, 0.35]):
+    if not pending:
+        break
+    log(f"── lượt {attempt} (T={temp}) trên {len(pending)} câu ──")
+    prompts, keep = [], []
+    for rec, ir in pending:
+        pr, ev, how = build_chat(rec, ir)
+        shrunk[how] += 1
+        prompts.append(pr)
+        keep.append(({**rec, "evidence": ev}, ir))
+    if attempt == 0:
+        log(f"   thu nhỏ prompt: {dict(shrunk.most_common())}")
+
+    sp = SamplingParams(temperature=temp, top_p=0.95 if temp else 1.0,
+                        max_tokens=800, seed=attempt,
+                        stop=["```\n\n", "\n\n\n"])
+    outs = llm.generate(prompts, sp)
+
+    still, n_ok, n_none, n_err = [], 0, 0, 0
+    for (rec, ir), o in zip(keep, outs):
+        code = extract_code(o.outputs[0].text)
+        res = run_query(code, frames_for(rec), timeout=8.0)
+        if res.ok:
+            patched[rec["id"]] = {
+                "id": rec["id"], "answer": res.value, "pandas_query": code,
+                "attempt": attempt, "rule_answer": rec["answer"],
+            }
+            n_ok += 1
+            journal.append({"id": rec["id"], "attempt": attempt, "status": "ok",
+                            "answer": res.value, "rule_answer": rec["answer"],
+                            "code": code})
+        else:
+            still.append((rec, ir))
+            if "None" in str(res.error) or res.raw is None:
+                n_none += 1
+            else:
+                n_err += 1
+            journal.append({"id": rec["id"], "attempt": attempt, "status": "fail",
+                            "error": res.error, "code": code[:400]})
+    log(f"   nhận {n_ok} · lỗi {n_err} · trả None {n_none} · còn lại {len(still)}")
+    pending = still
+
+# %% [markdown]
+# ## 5 — Ghi kết quả + log toàn hệ thống
+
+# %%
+with (OUT / "llm_patch.jsonl").open("w", encoding="utf-8") as f:
+    for v in patched.values():
+        f.write(json.dumps(v, ensure_ascii=False) + "\n")
+with (OUT / "llm_log.jsonl").open("w", encoding="utf-8") as f:
+    for j in journal:
+        f.write(json.dumps(j, ensure_ascii=False) + "\n")
+
+conflict = [(i, v["rule_answer"], v["answer"]) for i, v in patched.items()
+            if v["rule_answer"] and abs(v["answer"] - v["rule_answer"])
+            > 0.02 * abs(v["rule_answer"])]
+
+log("=" * 72)
+log(f"LLM giải được      : {len(patched)}/{len(targets)}  "
+    f"({len(patched)/max(len(targets),1):.1%})")
+log(f"theo lượt          : {dict(sorted(Counter(v['attempt'] for v in patched.values()).items()))}")
+log(f"không giải được    : {len(pending)} (giữ nguyên đáp án tất định)")
+log(f"lệch >2% so với rule: {len(conflict)}  ← soi tay nhóm này trước")
+for i, ra, la in conflict[:20]:
+    log(f"    q{i}: rule={ra!r}  llm={la!r}")
+log(f"→ {OUT/'llm_patch.jsonl'}   (mang về local)")
+log(f"→ {OUT/'llm_log.jsonl'}     (mọi lần sinh code, kể cả lỗi)")
+log("=" * 72)
+log("Ở máy local chạy:")
+log("   python scripts/apply_llm.py --sub out/v4 --patch llm_patch.jsonl --out out/v5")
+log("   → out/v5/submission.zip   (mỗi câu vá vào đều được chạy lại sandbox ở local)")
+
+# %% [markdown]
+# ## Dự phòng nếu vLLM lỗi kernel trên Turing
+#
+# ```bash
+# pip install -q llama-cpp-python \
+#   --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+# ```
+# ```python
+# from llama_cpp import Llama
+# llm = Llama.from_pretrained("Qwen/Qwen2.5-14B-Instruct-GGUF",
+#                             filename="*q4_k_m.gguf",
+#                             n_gpu_layers=-1, n_ctx=8192, split_mode=1)
+# out = llm.create_chat_completion(
+#     [{"role":"system","content":SYSTEM},{"role":"user","content":build_prompt(rec, ir)}],
+#     temperature=0.0, max_tokens=800)
+# code = extract_code(out["choices"][0]["message"]["content"])
+# ```
+# Chậm hơn ~3× nhưng cực ổn định. Giữ nguyên SYSTEM và vòng lặp retry ở trên.
+#
+# **Mô hình thay thế hợp lệ** (đều ≤14B, mã nguồn mở, phát hành trước 01/06/2026):
+# `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ` · `Qwen/Qwen3-14B-AWQ` ·
+# `Qwen/Qwen2.5-7B-Instruct-AWQ` (nhẹ, chạy 1×T4).
