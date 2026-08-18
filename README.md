@@ -52,15 +52,29 @@ Chi tiết từng lượt và lý do thay đổi: [CLAUDE.md](CLAUDE.md) §10.
 ## Cài đặt
 
 ```bash
-git clone <repo-url> && cd vifinqa-system
+git clone --depth 1 https://github.com/kimmttrung/vifinqa-system.git
+cd vifinqa-system
 python -m venv venv && venv/Scripts/activate      # Linux/macOS: source venv/bin/activate
 pip install -r requirements.txt
+python scripts/run_pipeline.py --tag v1 --k-max 6 --adaptive-k
 ```
 
 Yêu cầu **Python ≥ 3.11**. Đường tất định (Stage A→G) chạy **CPU thuần** — không cần
 GPU, không cần internet, không tải model nào.
 
-Dataset ViFinQA (363 MiB) nằm **ngoài** repo. Trỏ tới nó bằng biến môi trường:
+**Clone xong là chạy được ngay, không cần corpus.** Repo mang sẵn:
+
+| Trong repo | Dung lượng | Vì sao cần |
+|---|---|---|
+| `artifacts/*.parquet` · `bm25.*` | ~106 MB | kết quả Stage A + B + index, đủ để chạy Stage C→G |
+| `questions/questions.jsonl` | 225 KB | 1.012 câu hỏi |
+| `code_stock.csv` | 4 KB | 100 mã CK → tên công ty |
+
+Dùng `--depth 1`: artifacts nằm trong lịch sử git nên clone đủ lịch sử sẽ tải mọi
+phiên bản artifacts từng commit.
+
+Corpus gốc 363 MiB **không** nằm trong repo. Chỉ cần nó khi muốn dựng lại artifacts
+từ đầu (`build_corpus.py`) hoặc chạy tầng 4 của `verify_submission.py`:
 
 ```bash
 export VIFINQA_DATA=/duong/dan/toi/ViFinQA     # thư mục chứa financial_statements/
@@ -73,15 +87,20 @@ Nếu dataset là thư mục anh em của repo thì hệ thống tự tìm ra, k
 ## Chạy end-to-end
 
 ```bash
-python scripts/build_corpus.py        # Stage A   ~5 phút  → artifacts/tables.parquet
-python scripts/build_index.py         # Stage D   ~45 giây → artifacts/bm25.*
-python scripts/build_facts.py --notes # Stage B   ~30 giây → artifacts/facts.parquet
 python scripts/run_pipeline.py --tag v4 --k-max 6 --adaptive-k --trace
 ```
 
-Tổng ~12 phút trên một core, ra `out/v4/submission.zip`.
+Ra `out/v4/submission.zip` sau ~4–6 phút trên một core. Đây là lệnh duy nhất cần
+dùng thường xuyên, vì artifacts đã có sẵn trong repo.
 
-Ba bước đầu chỉ chạy một lần; sau đó vòng lặp thử–sai chỉ còn bước cuối (~6 phút).
+Chỉ khi muốn **dựng lại artifacts từ corpus gốc** (cần `VIFINQA_DATA`) mới phải chạy
+ba bước trước đó:
+
+```bash
+python scripts/build_corpus.py        # Stage A   ~2 phút  → artifacts/tables.parquet
+python scripts/build_index.py         # Stage D   ~45 giây → artifacts/bm25.*
+python scripts/build_facts.py --notes # Stage B   ~30 giây → artifacts/facts.parquet
+```
 
 ### Kiểm chứng trước khi nộp
 
@@ -186,8 +205,37 @@ src/     17 module top-level, phẳng — không có package con
 
 scripts/                CLI — chỉ 4 lệnh cần dùng thường xuyên
 tests/                  103 test, fixture cắt từ corpus thật
-notebooks/              Kaggle: stage_d_dense.py · stage_e_planner.py
+notebooks/              Kaggle: stage_d_dense · stage_e_planner (.py là nguồn, .ipynb sinh ra)
+artifacts/              CÓ commit — kết quả Stage A+B+index, ~106 MB
+questions/              1.012 câu hỏi
+code_stock.csv          100 mã CK → tên công ty
 ```
+
+---
+
+## Chạy Stage D+ / Stage E trên Kaggle
+
+Hai notebook GPU tự `git clone` chính repo này, nên **không cần Kaggle Dataset nào**:
+
+| Notebook | Accelerator | Ra | Thời gian |
+|---|---|---|---|
+| `notebooks/stage_d_dense.ipynb` | T4 ×1 | `rerank_cache.parquet` · `table_emb.f16.npy` | ~2–3 giờ |
+| `notebooks/stage_e_planner.ipynb` | T4 ×2 | `llm_patch.jsonl` · `llm_log.jsonl` | ~2,5–4 giờ |
+
+Các bước:
+
+1. Kaggle → New Notebook → **File → Import Notebook** → tải lên file `.ipynb`.
+2. Settings → **Accelerator** như bảng trên, **Internet: On**
+   (bật Internet đòi đã xác thực số điện thoại, nếu không thì `git clone` hỏng).
+3. Run All. Notebook tự clone repo, tự trỏ `VIFINQA_ARTIFACTS` vào bản clone.
+4. Tải file ở tab Output về, bỏ vào `artifacts/` rồi commit `rerank_cache.parquet`
+   ⇒ từ lần sau `retrieval.py` tự bật tầng hybrid RRF ở mọi nơi.
+
+`table_emb.f16.npy` (~300 MB) **đừng commit** — GitHub chặn cứng file >100 MB, và
+`.gitignore` đã chặn sẵn. Nó chỉ để chạy lại Stage D+ mà không phải embed lần nữa.
+
+Stage E không cần upload `submission.zip`: nó tự chạy `run_pipeline.py` trong session
+để dựng bài nộp nền, nên bài nền luôn khớp với code trong repo.
 
 ---
 
