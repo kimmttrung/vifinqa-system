@@ -228,11 +228,26 @@ Các bước:
 2. Settings → **Accelerator** như bảng trên, **Internet: On**
    (bật Internet đòi đã xác thực số điện thoại, nếu không thì `git clone` hỏng).
 3. Run All. Notebook tự clone repo, tự trỏ `VIFINQA_ARTIFACTS` vào bản clone.
+   Log đầu tiên in ra nó đang đọc artifacts từ nguồn nào.
 4. Tải file ở tab Output về, bỏ vào `artifacts/` rồi commit `rerank_cache.parquet`
    ⇒ từ lần sau `retrieval.py` tự bật tầng hybrid RRF ở mọi nơi.
 
 `table_emb.f16.npy` (~300 MB) **đừng commit** — GitHub chặn cứng file >100 MB, và
 `.gitignore` đã chặn sẵn. Nó chỉ để chạy lại Stage D+ mà không phải embed lần nữa.
+
+### Nếu không push được `artifacts/` lên GitHub
+
+Repo ~106 MB, push có thể hỏng vì mạng hoặc vì bạn muốn giữ repo gọn. Khi đó dùng
+Kaggle Dataset thay thế, **không phải sửa notebook**:
+
+1. Nén/tải thư mục `artifacts/` lên https://www.kaggle.com/datasets → New Dataset.
+2. Trong notebook: **+ Add Input** → chọn dataset vừa tạo.
+3. Run All như thường.
+
+Notebook ưu tiên `artifacts/` trong repo; không thấy thì tự dò `table_meta.parquet`
+trong `/kaggle/input` (chịu được cả hai kiểu upload: giữ nguyên thư mục `artifacts/`
+hoặc đổ phẳng các file ra gốc dataset). Dòng log `artifacts : … ← nguồn` cho biết
+nó đang đọc bản nào — đọc dòng đó trước khi tin kết quả.
 
 Stage E không cần upload `submission.zip`: nó tự chạy `run_pipeline.py` trong session
 để dựng bài nộp nền, nên bài nền luôn khớp với code trong repo.

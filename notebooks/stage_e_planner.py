@@ -3,15 +3,27 @@
 #
 # **Accelerator : GPU T4 ×2** · **Internet : ON** · thời gian ~2,5–4 giờ
 #
-# | Vào | Ra |
-# |---|---|
-# | `git clone` repo (đã kèm `artifacts/` + `questions/`) | `llm_patch.jsonl` · `llm_log.jsonl` |
+# ## INPUT
 #
-# **Không cần Kaggle Dataset nào, cũng không phải upload `submission.zip` sẵn.**
-# Notebook tự chạy `run_pipeline.py` ngay trong session để dựng bài nộp nền
-# (~4–8 phút CPU), rồi LLM vá lên trên đó. Nhờ vậy bài nền LUÔN khớp với code
-# đang có trong repo — không còn cảnh vá `llm_patch` của hôm nay lên
-# `submission.zip` dựng từ code của tuần trước.
+# | Thứ | Lấy từ đâu |
+# |---|---|
+# | code (`src/*.py`, `scripts/run_pipeline.py`) | `git clone` repo |
+# | `artifacts/*` · `questions/questions.jsonl` | repo, **hoặc** Kaggle Dataset đính kèm |
+# | `artifacts/rerank_cache.parquet` | tuỳ chọn — có thì bài nộp nền dùng hybrid RRF |
+# | model 14B AWQ | tải qua Internet |
+#
+# **Không phải upload `submission.zip` sẵn.** Notebook tự chạy `run_pipeline.py`
+# ngay trong session để dựng bài nộp nền (~4–8 phút CPU), rồi LLM vá lên trên đó.
+# Nhờ vậy bài nền LUÔN khớp với code trong repo — không còn cảnh vá `llm_patch`
+# của hôm nay lên `submission.zip` dựng từ code của tuần trước.
+#
+# ## OUTPUT — tab Output, `/kaggle/working/`
+#
+# | File | Làm gì với nó |
+# |---|---|
+# | `llm_patch.jsonl` | **kết quả chính** — mang về local chạy `apply_llm.py` |
+# | `llm_log.jsonl` | mọi lần sinh code kể cả lỗi, để soi câu nào hỏng vì sao |
+# | `out/base/` | bài nộp nền dựng tại chỗ (không cần mang về) |
 #
 # Mang `llm_patch.jsonl` về local rồi:
 # `python scripts/apply_llm.py --sub out/v4 --patch llm_patch.jsonl --out out/v5`
@@ -64,8 +76,7 @@ BASE_TAG = "base"
 
 T_START = time.time()
 IN_KAGGLE = Path("/kaggle/working").exists()
-OUT = Path("/kaggle/working") if IN_KAGGLE else Path("out/llm")
-OUT.mkdir(parents=True, exist_ok=True)
+KAGGLE_INPUT = Path("/kaggle/input")
 
 
 def log(msg: str) -> None:
@@ -73,7 +84,11 @@ def log(msg: str) -> None:
 
 
 def get_repo() -> Path:
-    """Clone repo trên Kaggle · dò ngược lên cây thư mục khi chạy local."""
+    """Clone repo trên Kaggle · dò ngược lên cây thư mục khi chạy local.
+
+    `--depth 1` là bắt buộc khi repo mang theo artifacts/: clone đủ lịch sử sẽ
+    tải lại mọi phiên bản artifacts của mọi commit.
+    """
     if not IN_KAGGLE:
         here = Path.cwd().resolve()
         for cand in [here, *here.parents]:
@@ -94,15 +109,72 @@ def get_repo() -> Path:
     return dst
 
 
+def find_under(root: Path, name: str, max_depth: int = 4) -> Path | None:
+    """File `name` nông nhất dưới `root`. Kaggle mount dataset ở độ sâu không đoán trước."""
+    if not root.exists():
+        return None
+    for d in range(max_depth + 1):
+        hits = sorted(root.glob("/".join(["*"] * d + [name])))
+        if hits:
+            return hits[0]
+    return None
+
+
+def resolve_artifacts(repo: Path) -> tuple[Path, str]:
+    """artifacts/ lấy từ repo, KHÔNG có thì lấy từ Kaggle Dataset đính kèm.
+
+    Hai nguồn vì repo ~106 MB có thể không push được (mạng, hoặc GitHub chặn file
+    >100 MB). Khi đó vào Kaggle → + Add Input → Dataset chứa artifacts là chạy tiếp
+    được, không phải sửa notebook. Trả về cả nguồn để in ra cho biết đang dùng cái nào.
+    """
+    local = repo / "artifacts"
+    if (local / "table_meta.parquet").exists():
+        return local, "repo (đã commit)"
+    hit = find_under(KAGGLE_INPUT, "table_meta.parquet")
+    if hit:
+        return hit.parent, f"Kaggle Dataset ({hit.parent})"
+    raise FileNotFoundError(
+        "Không tìm thấy table_meta.parquet ở đâu cả.\n"
+        "  Cách 1: commit artifacts/ lên GitHub rồi push.\n"
+        "  Cách 2: tạo Kaggle Dataset chứa artifacts/ rồi + Add Input vào notebook.")
+
+
+def resolve_questions(repo: Path, arti: Path) -> Path:
+    for c in (repo / "questions" / "questions.jsonl",
+              arti / "questions.jsonl",
+              arti.parent / "questions" / "questions.jsonl"):
+        if c.exists():
+            return c
+    hit = find_under(KAGGLE_INPUT, "questions.jsonl")
+    if hit:
+        return hit
+    raise FileNotFoundError("Không tìm thấy questions.jsonl (repo hoặc Kaggle Dataset)")
+
+
 REPO = get_repo()
 sys.path.insert(0, str(REPO / "src"))
-# Trỏ THẲNG vào repo: trên Kaggle có thể còn Dataset cũ đính kèm, và hàm dò
-# đường dẫn trong common.py quét /kaggle/input TRƯỚC nên dễ nhặt nhầm bản cũ.
-os.environ["VIFINQA_ARTIFACTS"] = str(REPO / "artifacts")
-os.environ["VIFINQA_QUESTIONS"] = str(REPO / "questions" / "questions.jsonl")
+ARTI, ARTI_SRC = resolve_artifacts(REPO)
+QUES = resolve_questions(REPO, ARTI)
+# Trỏ THẲNG bằng biến môi trường thay vì để common.py tự dò: hàm dò quét
+# /kaggle/input TRƯỚC, nên còn Dataset cũ đính kèm là nó nhặt nhầm bản cũ mà
+# không báo gì.
+os.environ["VIFINQA_ARTIFACTS"] = str(ARTI)
+os.environ["VIFINQA_QUESTIONS"] = str(QUES)
+
+NEED = ["table_meta.parquet", "docs.parquet", "facts.parquet",
+        "bm25.tf.npz", "bm25.meta.npz", "bm25.vocab.json"]
+miss = [n for n in NEED if not (ARTI / n).exists()]
+if miss:
+    raise FileNotFoundError(f"artifacts thiếu file: {miss}  (đang đọc {ARTI})")
 
 from execute import run_query                # noqa: E402
 from qparse import parse_question            # noqa: E402
+from common import ARTIFACTS                 # noqa: E402
+
+OUT = Path("/kaggle/working") if IN_KAGGLE else Path("out/llm")
+OUT.mkdir(parents=True, exist_ok=True)
+log(f"repo      : {REPO}")
+log(f"artifacts : {ARTIFACTS}   ← {ARTI_SRC}")
 
 # ── bài nộp nền: dựng TẠI CHỖ bằng chính code vừa clone ──
 # Trước đây bước này giải nén một submission.zip upload sẵn. Bỏ đi vì bài nền

@@ -3,16 +3,33 @@
 #
 # **Accelerator : GPU T4 ×1** · **Internet : ON** · một lần chạy ~2–3 giờ
 #
-# | Vào | Ra |
-# |---|---|
-# | `git clone` repo (đã kèm `artifacts/` + `questions/`) | `table_emb.f16.npy` · `rerank_cache.parquet` |
+# ## INPUT — notebook tự lấy, bạn không phải chuẩn bị gì
 #
-# **Không cần Kaggle Dataset nào.** Repo đã mang sẵn `artifacts/` nên clone xong là
-# chạy được. Chỉ cần bật **Internet: On** (để clone + tải model từ HuggingFace).
+# | Thứ | Lấy từ đâu | Bắt buộc |
+# |---|---|---|
+# | code (`src/*.py`) | `git clone` repo | có |
+# | `artifacts/table_meta.parquet` (146.246 bảng + passage) | repo, **hoặc** Kaggle Dataset đính kèm | có |
+# | `artifacts/{docs,facts}.parquet` · `bm25.*` | cùng nguồn với trên | có |
+# | `questions/questions.jsonl` (1.012 câu) | repo, hoặc Kaggle Dataset | có |
+# | `artifacts/table_emb.f16.npy` | lần chạy trước | không — có thì bỏ qua khâu embed |
+# | 2 model HuggingFace | tải qua Internet | có |
 #
-# Chạy xong: tải `rerank_cache.parquet` ở tab Output, bỏ vào `artifacts/` của repo
-# rồi commit ⇒ `src/retrieval.py` tự bật tầng hybrid RRF ở mọi lần chạy sau, cả
-# local lẫn Kaggle, không phải sửa dòng code nào.
+# **Artifacts có hai nguồn.** Ưu tiên `artifacts/` trong repo. Nếu repo không kèm
+# được (106 MB, có thể push hỏng) thì vào **+ Add Input** → chọn Dataset chứa
+# artifacts; notebook tự dò trong `/kaggle/input` và in ra nó đang đọc nguồn nào.
+# Không phải sửa dòng code nào.
+#
+# ## OUTPUT — nằm ở tab Output, `/kaggle/working/`
+#
+# | File | Kích thước | Làm gì với nó |
+# |---|---|---|
+# | `rerank_cache.parquet` | ~1 MB | **kết quả chính**: bỏ vào `artifacts/` rồi commit ⇒ `src/retrieval.py` tự bật hybrid RRF ở mọi lần chạy sau |
+# | `table_emb.f16.npy` | ~300 MB | tuỳ chọn: giữ lại để lần sau khỏi embed. **Đừng commit** — GitHub chặn file >100 MB |
+#
+# Notebook **không** sinh submission. Bài nộp vẫn dựng ở local (hoặc ở Stage E)
+# bằng `run_pipeline.py` sau khi đã có `rerank_cache.parquet`.
+#
+# Chỉ cần bật **Internet: On** (để `git clone` + tải model từ HuggingFace).
 #
 # ---
 # ## Hai model, cố định — không dò, không fallback
@@ -56,8 +73,7 @@ REPO_BRANCH = "main"
 
 T_START = time.time()
 IN_KAGGLE = Path("/kaggle/working").exists()
-OUT = Path("/kaggle/working") if IN_KAGGLE else Path("artifacts")
-OUT.mkdir(parents=True, exist_ok=True)
+KAGGLE_INPUT = Path("/kaggle/input")
 
 
 def log(msg: str) -> None:
@@ -67,8 +83,8 @@ def log(msg: str) -> None:
 def get_repo() -> Path:
     """Clone repo trên Kaggle · dò ngược lên cây thư mục khi chạy local.
 
-    `--depth 1` là bắt buộc: repo mang theo artifacts/ (~106 MB/bản), clone đủ
-    lịch sử sẽ tải mọi phiên bản artifacts từng commit.
+    `--depth 1` là bắt buộc khi repo mang theo artifacts/: clone đủ lịch sử sẽ
+    tải lại mọi phiên bản artifacts của mọi commit.
     """
     if not IN_KAGGLE:
         here = Path.cwd().resolve()
@@ -90,35 +106,88 @@ def get_repo() -> Path:
     return dst
 
 
+def find_under(root: Path, name: str, max_depth: int = 4) -> Path | None:
+    """File `name` nông nhất dưới `root`. Kaggle mount dataset ở độ sâu không đoán trước."""
+    if not root.exists():
+        return None
+    for d in range(max_depth + 1):
+        hits = sorted(root.glob("/".join(["*"] * d + [name])))
+        if hits:
+            return hits[0]
+    return None
+
+
+def resolve_artifacts(repo: Path) -> tuple[Path, str]:
+    """artifacts/ lấy từ repo, KHÔNG có thì lấy từ Kaggle Dataset đính kèm.
+
+    Hai nguồn vì repo ~106 MB có thể không push được (mạng, hoặc GitHub chặn file
+    >100 MB). Khi đó vào Kaggle → + Add Input → Dataset chứa artifacts là chạy tiếp
+    được, không phải sửa notebook. Trả về cả nguồn để in ra cho biết đang dùng cái nào.
+    """
+    local = repo / "artifacts"
+    if (local / "table_meta.parquet").exists():
+        return local, "repo (đã commit)"
+    hit = find_under(KAGGLE_INPUT, "table_meta.parquet")
+    if hit:
+        return hit.parent, f"Kaggle Dataset ({hit.parent})"
+    raise FileNotFoundError(
+        "Không tìm thấy table_meta.parquet ở đâu cả.\n"
+        "  Cách 1: commit artifacts/ lên GitHub rồi push.\n"
+        "  Cách 2: tạo Kaggle Dataset chứa artifacts/ rồi + Add Input vào notebook.")
+
+
+def resolve_questions(repo: Path, arti: Path) -> Path:
+    for c in (repo / "questions" / "questions.jsonl",
+              arti / "questions.jsonl",
+              arti.parent / "questions" / "questions.jsonl"):
+        if c.exists():
+            return c
+    hit = find_under(KAGGLE_INPUT, "questions.jsonl")
+    if hit:
+        return hit
+    raise FileNotFoundError("Không tìm thấy questions.jsonl (repo hoặc Kaggle Dataset)")
+
+
 REPO = get_repo()
 sys.path.insert(0, str(REPO / "src"))
-# Trỏ THẲNG vào repo thay vì để common.py tự dò: trên Kaggle có thể còn Dataset cũ
-# đính kèm, và hàm dò quét /kaggle/input TRƯỚC nên sẽ nhặt nhầm artifacts cũ.
-os.environ["VIFINQA_ARTIFACTS"] = str(REPO / "artifacts")
-os.environ["VIFINQA_QUESTIONS"] = str(REPO / "questions" / "questions.jsonl")
+ARTI, ARTI_SRC = resolve_artifacts(REPO)
+QUES = resolve_questions(REPO, ARTI)
+# Trỏ THẲNG bằng biến môi trường thay vì để common.py tự dò: hàm dò quét
+# /kaggle/input TRƯỚC, nên còn Dataset cũ đính kèm là nó nhặt nhầm bản cũ mà
+# không báo gì.
+os.environ["VIFINQA_ARTIFACTS"] = str(ARTI)
+os.environ["VIFINQA_QUESTIONS"] = str(QUES)
+
+NEED = ["table_meta.parquet", "docs.parquet", "facts.parquet",
+        "bm25.tf.npz", "bm25.meta.npz", "bm25.vocab.json"]
+miss = [n for n in NEED if not (ARTI / n).exists()]
+if miss:
+    raise FileNotFoundError(f"artifacts thiếu file: {miss}  (đang đọc {ARTI})")
 
 from docfilter import filter_docs           # noqa: E402
 from qparse import parse_question           # noqa: E402
-from common import ARTIFACTS, load_questions  # noqa: E402
+from common import ARTIFACTS, load_code_stock, load_questions  # noqa: E402
 
-need = ["table_meta.parquet", "docs.parquet", "facts.parquet",
-        "bm25.tf.npz", "bm25.meta.npz", "bm25.vocab.json"]
-miss = [n for n in need if not (ARTIFACTS / n).exists()]
-if miss:
-    raise FileNotFoundError(
-        f"Thiếu artifacts trong repo: {miss}\n"
-        "artifacts/ phải được commit lên GitHub (xem README §Chạy trên Kaggle).")
+OUT = Path("/kaggle/working") if IN_KAGGLE else ARTIFACTS
+OUT.mkdir(parents=True, exist_ok=True)
 
 log(f"repo      : {REPO}")
-log(f"artifacts : {ARTIFACTS}")
+log(f"artifacts : {ARTIFACTS}   ← {ARTI_SRC}")
+log(f"questions : {QUES}")
+log(f"output    : {OUT}")
 log(f"GPU       : {torch.cuda.get_device_name(0)} ×{torch.cuda.device_count()}  "
     f"({torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB)")
 
+# Cột `row` ĐỌC TỪ parquet, không tự đánh lại số. retrieval.py khoá rerank_cache
+# theo đúng cột này; tự đánh lại thì hôm nào build_index đổi thứ tự là lệch âm
+# thầm — cache vẫn nạp được, chỉ trỏ sang bảng khác.
 meta = pd.read_parquet(ARTIFACTS / "table_meta.parquet",
-                       columns=["doc_id", "table_idx", "section", "passage"])
-meta["row"] = range(len(meta))
+                       columns=["doc_id", "table_idx", "section", "passage", "row"])
+assert (meta["row"].to_numpy() == np.arange(len(meta))).all(), \
+    "cột row trong table_meta.parquet không còn khớp thứ tự dòng"
 questions = load_questions()
-log(f"bảng      : {len(meta):,}   câu hỏi: {len(questions)}")
+log(f"bảng      : {len(meta):,}   câu hỏi: {len(questions)}   "
+    f"mã CK: {len(load_code_stock())}")
 
 # %% [markdown]
 # ## 1 — Hằng số model
