@@ -5,7 +5,13 @@
 #
 # | Vào | Ra |
 # |---|---|
-# | `vifinqa-bundle` (artifacts + questions + src + submission.zip) | `llm_patch.jsonl` · `llm_log.jsonl` |
+# | `git clone` repo (đã kèm `artifacts/` + `questions/`) | `llm_patch.jsonl` · `llm_log.jsonl` |
+#
+# **Không cần Kaggle Dataset nào, cũng không phải upload `submission.zip` sẵn.**
+# Notebook tự chạy `run_pipeline.py` ngay trong session để dựng bài nộp nền
+# (~4–8 phút CPU), rồi LLM vá lên trên đó. Nhờ vậy bài nền LUÔN khớp với code
+# đang có trong repo — không còn cảnh vá `llm_patch` của hôm nay lên
+# `submission.zip` dựng từ code của tuần trước.
 #
 # Mang `llm_patch.jsonl` về local rồi:
 # `python scripts/apply_llm.py --sub out/v4 --patch llm_patch.jsonl --out out/v5`
@@ -44,16 +50,20 @@
 import json
 import os
 import re
+import subprocess
 import sys
 import time
-import zipfile
 from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 
+REPO_URL = "https://github.com/kimmttrung/vifinqa-system.git"
+REPO_BRANCH = "main"
+BASE_TAG = "base"
+
 T_START = time.time()
-IN_KAGGLE = Path("/kaggle/input").exists()
+IN_KAGGLE = Path("/kaggle/working").exists()
 OUT = Path("/kaggle/working") if IN_KAGGLE else Path("out/llm")
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -62,40 +72,56 @@ def log(msg: str) -> None:
     print(f"[{time.time()-T_START:7.1f}s] {msg}", flush=True)
 
 
-def find(marker: str) -> Path:
-    roots = [Path("/kaggle/input")] if IN_KAGGLE else [Path.cwd(), Path.cwd().parent]
-    for root in roots:
-        if not root.exists():
-            continue
-        if (root / marker).exists():
-            return root
-        for d in range(1, 6):
-            hits = list(root.glob("/".join(["*"] * d) + "/" + marker))
-            if hits:
-                return hits[0].parents[len(Path(marker).parts) - 1]
-    raise FileNotFoundError(f"Không thấy {marker}")
+def get_repo() -> Path:
+    """Clone repo trên Kaggle · dò ngược lên cây thư mục khi chạy local."""
+    if not IN_KAGGLE:
+        here = Path.cwd().resolve()
+        for cand in [here, *here.parents]:
+            if (cand / "src" / "qparse.py").exists():
+                return cand
+        raise FileNotFoundError("Không thấy src/qparse.py — chạy notebook từ trong repo")
+
+    dst = Path("/kaggle/working/vifinqa-system")
+    if not (dst / "src" / "qparse.py").exists():
+        log(f"clone {REPO_URL} …")
+        rc = subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", REPO_BRANCH, REPO_URL, str(dst)],
+            capture_output=True, text=True)
+        if rc.returncode:
+            raise RuntimeError(
+                f"git clone hỏng (rc={rc.returncode}): {rc.stderr.strip()[:400]}\n"
+                "Kiểm tra Settings → Internet: On (cần xác thực số điện thoại).")
+    return dst
 
 
-BUNDLE = find("src/qparse.py")
-sys.path.insert(0, str(BUNDLE / "src"))
-os.environ.setdefault("VIFINQA_ARTIFACTS",
-                      str(find("artifacts/table_meta.parquet") / "artifacts"))
+REPO = get_repo()
+sys.path.insert(0, str(REPO / "src"))
+# Trỏ THẲNG vào repo: trên Kaggle có thể còn Dataset cũ đính kèm, và hàm dò
+# đường dẫn trong common.py quét /kaggle/input TRƯỚC nên dễ nhặt nhầm bản cũ.
+os.environ["VIFINQA_ARTIFACTS"] = str(REPO / "artifacts")
+os.environ["VIFINQA_QUESTIONS"] = str(REPO / "questions" / "questions.jsonl")
 
 from execute import run_query                # noqa: E402
 from qparse import parse_question            # noqa: E402
 
-# ── giải nén submission.zip: 1 file thay vì 4.900 file lẻ (Kaggle rất chậm với
-#    dataset nhiều file nhỏ) ──
-BASE = Path("/kaggle/working/base") if IN_KAGGLE else Path("out/v4")
-if IN_KAGGLE:
-    zpath = next(Path("/kaggle/input").rglob("submission.zip"))
-    BASE.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zpath) as z:
-        z.extractall(BASE)
-    log(f"giải nén {zpath} → {BASE}")
+# ── bài nộp nền: dựng TẠI CHỖ bằng chính code vừa clone ──
+# Trước đây bước này giải nén một submission.zip upload sẵn. Bỏ đi vì bài nền
+# và code rất dễ lệch phiên bản, mà lệch thì `evidence`/`csv_path` trong prompt
+# trỏ sang bảng khác, hỏng âm thầm.
+BASE = (Path("/kaggle/working/out") if IN_KAGGLE else Path("out")) / BASE_TAG
+if not (BASE / "submission.json").exists():
+    log(f"dựng bài nộp nền bằng run_pipeline.py (~4–8 phút) → {BASE}")
+    rc = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "run_pipeline.py"),
+         "--tag", BASE_TAG, "--k-max", "6", "--adaptive-k"],
+        cwd=str(REPO), capture_output=True, text=True)
+    print(rc.stdout[-2500:])
+    if rc.returncode or not (BASE / "submission.json").exists():
+        raise RuntimeError(f"run_pipeline.py hỏng: {rc.stderr.strip()[-800:]}")
 
 records = json.loads((BASE / "submission.json").read_text(encoding="utf-8"))
-log(f"bundle {BUNDLE}  ·  base {BASE}  ·  {len(records)} câu")
+log(f"repo {REPO}  ·  base {BASE}  ·  {len(records)} câu")
+log(f"hybrid RRF: {'BẬT' if (REPO/'artifacts'/'rerank_cache.parquet').exists() else 'tắt (chưa có rerank_cache.parquet — chạy Stage D+ trước)'}")
 
 # %% [markdown]
 # ## 1 — Chọn phạm vi

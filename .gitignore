@@ -3,15 +3,26 @@
 # Git trên Windows bật core.ignorecase, nên `ViFinQA/` sẽ khớp luôn
 # thư mục source và làm biến mất toàn bộ source code khỏi repo.
 # Dataset nằm NGOÀI repo (thư mục anh em) nên vốn dĩ không cần ignore.
+#
+# LƯU Ý CÚ PHÁP: .gitignore KHÔNG hỗ trợ comment cuối dòng. `out/   # ghi chú`
+# bị hiểu là pattern "out/   # ghi chú" và không ignore gì cả. Comment phải
+# đứng riêng một dòng.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Sinh lại được từ corpus bằng scripts/build_*.py — không commit
-artifacts/
-out/
-kaggle_bundle/
+# artifacts/ CÓ commit — để `git clone` là chạy được ngay trên Kaggle mà không
+# cần corpus gốc 363 MiB. Đổi lại repo nặng ~106 MB và mỗi lần dựng lại artifacts
+# là thêm ~106 MB blob VĨNH VIỄN trong lịch sử. Chỉ commit lại khi Stage A/B
+# thực sự đổi kết quả, đừng commit mỗi lần chạy build_*.py.
 
-# Notebook .ipynb sinh từ .py bằng scripts/py2ipynb.py
-notebooks/*.ipynb
+# ~300 MB — GitHub CHẶN CỨNG mọi file >100 MB. Đây là output tuỳ chọn của
+# Stage D+, pipeline local không đọc nó.
+artifacts/table_emb.f16.npy
+
+# 30 MB mỗi lần chạy, sinh lại bằng run_pipeline.py
+out/
+
+# sinh lại bằng package_kaggle.py
+kaggle_bundle/
 
 # Python
 __pycache__/
@@ -34,6 +45,8 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Tài liệu nội bộ, không public
 CLAUDE.md
 KAGGLE.md
 /docs

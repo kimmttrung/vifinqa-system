@@ -1,20 +1,35 @@
 # %% [markdown]
 # # ViFinQA — Stage D+ : Dense retrieval + Cross-encoder Reranker
 #
-# **Accelerator : GPU T4 ×1** · **Internet : ON** · thời gian ~60–80 phút
+# **Accelerator : GPU T4 ×1** · **Internet : ON** · một lần chạy ~2–3 giờ
 #
 # | Vào | Ra |
 # |---|---|
-# | Kaggle Dataset `vifinqa-bundle` (artifacts + questions + src) | `table_emb.f16.npy` · `rerank_cache.parquet` |
+# | `git clone` repo (đã kèm `artifacts/` + `questions/`) | `table_emb.f16.npy` · `rerank_cache.parquet` |
 #
-# Tải `rerank_cache.parquet` về bỏ vào `artifacts/` ở máy local ⇒ `src/retrieval.py`
-# tự bật tầng hybrid RRF, không phải sửa dòng code nào.
+# **Không cần Kaggle Dataset nào.** Repo đã mang sẵn `artifacts/` nên clone xong là
+# chạy được. Chỉ cần bật **Internet: On** (để clone + tải model từ HuggingFace).
+#
+# Chạy xong: tải `rerank_cache.parquet` ở tab Output, bỏ vào `artifacts/` của repo
+# rồi commit ⇒ `src/retrieval.py` tự bật tầng hybrid RRF ở mọi lần chạy sau, cả
+# local lẫn Kaggle, không phải sửa dòng code nào.
 #
 # ---
-# ## Vì sao Qwen3-Embedding-**4B** chứ không phải 8B
-# Mentor đo: 4B + reranker = **80,19 %** Recall@10 · 8B + reranker = **80,80 %**.
-# Chênh **0,61 %**. Nhưng 8B fp16 = 16 GB, **không vừa 1×T4 (≈15 GB khả dụng)**.
-# Trả 2× chi phí cho 0,61 % là lỗ.
+# ## Hai model, cố định — không dò, không fallback
+#
+# | Vai trò | Model | VRAM fp16 |
+# |---|---|---|
+# | Bi-encoder | `Qwen/Qwen3-Embedding-4B` | ~8,0 GB |
+# | Cross-encoder | `BAAI/bge-reranker-v2-m3` | ~1,2 GB |
+#
+# Cả hai nạp đồng thời ≈ 9,2 GB, vừa 1×T4 (≈15 GB khả dụng).
+#
+# **4B chứ không phải 8B**: mentor đo 4B + reranker = 80,19 % Recall@10 · 8B +
+# reranker = 80,80 %. Chênh 0,61 %, nhưng 8B fp16 = 16 GB **không vừa 1×T4**.
+#
+# **Muốn chạy nhanh gấp ~5 lần**: đổi `EMB_MODEL` sang `Qwen/Qwen3-Embedding-0.6B`
+# ở cell hằng số bên dưới — cùng họ nên pooling và prefix giữ nguyên, chỉ đổi một
+# dòng. Đánh đổi chất lượng chưa đo trên corpus này.
 #
 # ## Vì sao KHÔNG dùng FAISS
 # Pipeline luôn lọc metadata trước: 1.973 doc → trung vị 2 doc → vài trăm bảng.
@@ -26,8 +41,8 @@
 
 # %%
 import gc
-import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -36,8 +51,11 @@ import numpy as np
 import pandas as pd
 import torch
 
+REPO_URL = "https://github.com/kimmttrung/vifinqa-system.git"
+REPO_BRANCH = "main"
+
 T_START = time.time()
-IN_KAGGLE = Path("/kaggle/input").exists()
+IN_KAGGLE = Path("/kaggle/working").exists()
 OUT = Path("/kaggle/working") if IN_KAGGLE else Path("artifacts")
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -46,30 +64,52 @@ def log(msg: str) -> None:
     print(f"[{time.time()-T_START:7.1f}s] {msg}", flush=True)
 
 
-# ── định vị bundle & nạp module (layout phẳng src/) ──
-def find(marker: str) -> Path:
-    roots = [Path("/kaggle/input")] if IN_KAGGLE else [Path.cwd(), Path.cwd().parent]
-    for root in roots:
-        if not root.exists():
-            continue
-        if (root / marker).exists():
-            return root
-        for d in range(1, 6):
-            hits = list(root.glob("/".join(["*"] * d) + "/" + marker))
-            if hits:
-                return hits[0].parents[len(Path(marker).parts) - 1]
-    raise FileNotFoundError(f"Không thấy {marker} trong {roots}")
+def get_repo() -> Path:
+    """Clone repo trên Kaggle · dò ngược lên cây thư mục khi chạy local.
+
+    `--depth 1` là bắt buộc: repo mang theo artifacts/ (~106 MB/bản), clone đủ
+    lịch sử sẽ tải mọi phiên bản artifacts từng commit.
+    """
+    if not IN_KAGGLE:
+        here = Path.cwd().resolve()
+        for cand in [here, *here.parents]:
+            if (cand / "src" / "qparse.py").exists():
+                return cand
+        raise FileNotFoundError("Không thấy src/qparse.py — chạy notebook từ trong repo")
+
+    dst = Path("/kaggle/working/vifinqa-system")
+    if not (dst / "src" / "qparse.py").exists():
+        log(f"clone {REPO_URL} …")
+        rc = subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", REPO_BRANCH, REPO_URL, str(dst)],
+            capture_output=True, text=True)
+        if rc.returncode:
+            raise RuntimeError(
+                f"git clone hỏng (rc={rc.returncode}): {rc.stderr.strip()[:400]}\n"
+                "Kiểm tra Settings → Internet: On (cần xác thực số điện thoại).")
+    return dst
 
 
-BUNDLE = find("src/qparse.py")
-sys.path.insert(0, str(BUNDLE / "src"))
-os.environ.setdefault("VIFINQA_ARTIFACTS", str(find("artifacts/table_meta.parquet") / "artifacts"))
+REPO = get_repo()
+sys.path.insert(0, str(REPO / "src"))
+# Trỏ THẲNG vào repo thay vì để common.py tự dò: trên Kaggle có thể còn Dataset cũ
+# đính kèm, và hàm dò quét /kaggle/input TRƯỚC nên sẽ nhặt nhầm artifacts cũ.
+os.environ["VIFINQA_ARTIFACTS"] = str(REPO / "artifacts")
+os.environ["VIFINQA_QUESTIONS"] = str(REPO / "questions" / "questions.jsonl")
 
 from docfilter import filter_docs           # noqa: E402
 from qparse import parse_question           # noqa: E402
 from common import ARTIFACTS, load_questions  # noqa: E402
 
-log(f"bundle    : {BUNDLE}")
+need = ["table_meta.parquet", "docs.parquet", "facts.parquet",
+        "bm25.tf.npz", "bm25.meta.npz", "bm25.vocab.json"]
+miss = [n for n in need if not (ARTIFACTS / n).exists()]
+if miss:
+    raise FileNotFoundError(
+        f"Thiếu artifacts trong repo: {miss}\n"
+        "artifacts/ phải được commit lên GitHub (xem README §Chạy trên Kaggle).")
+
+log(f"repo      : {REPO}")
 log(f"artifacts : {ARTIFACTS}")
 log(f"GPU       : {torch.cuda.get_device_name(0)} ×{torch.cuda.device_count()}  "
     f"({torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB)")
@@ -81,10 +121,39 @@ questions = load_questions()
 log(f"bảng      : {len(meta):,}   câu hỏi: {len(questions)}")
 
 # %% [markdown]
-# ## 1a — PREFLIGHT: kiểm tra mạng + model TRƯỚC khi làm việc nặng
+# ## 1 — Hằng số model
 #
-# **Chạy cell này trước.** Nó mất 30 giây và cứu bạn khỏi việc phát hiện lỗi sau
-# 20 phút chờ.
+# `EMB_POOL` và `EMB_PREFIX` đi LIỀN với `EMB_MODEL`, đổi model thì phải đổi kèm:
+#
+# | Họ model | pooling | padding | instruct prefix ở query |
+# |---|---|---|---|
+# | Qwen3-Embedding | `last` | left | **có** |
+# | BGE-M3 / Vietnamese_Embedding | `cls` | right | không |
+#
+# Dùng sai kiểu pooling **không báo lỗi** — nó chỉ làm chất lượng tụt âm thầm.
+#
+# `EMB_DIM = 1024`: với Qwen3-Embedding đây là Matryoshka (cắt 2560 → 1024, gần
+# như không mất chất lượng); index còn 300 MB thay vì 748 MB, vừa một Kaggle Dataset.
+
+# %%
+EMB_MODEL = "Qwen/Qwen3-Embedding-4B"    # ← đổi sang "Qwen/Qwen3-Embedding-0.6B" nếu cần nhanh
+EMB_POOL = "last"                        # Qwen3-Embedding: last-token pooling
+EMB_PREFIX = True                        # Qwen3-Embedding: instruct prefix ở PHÍA QUERY
+EMB_DIM = 1024                           # Matryoshka: cắt từ hidden_size gốc
+
+RERANK_MODEL = "BAAI/bge-reranker-v2-m3"  # 568M, đa ngữ, chạy ổn trên sm75
+
+BATCH, MAXLEN = 24, 384
+EMB_PATH = OUT / "table_emb.f16.npy"
+
+log(f"embedder  : {EMB_MODEL}  (pool={EMB_POOL}, dim={EMB_DIM})")
+log(f"reranker  : {RERANK_MODEL}")
+
+# %% [markdown]
+# ## 1a — PREFLIGHT: kiểm tra mạng + hai model TRƯỚC khi làm việc nặng
+#
+# **Chạy cell này trước.** Nó tải vài KB `config.json` (không phải weights), mất
+# ~30 giây, và cứu bạn khỏi việc phát hiện lỗi sau 20 phút chờ.
 #
 # > ### Bẫy Kaggle phải biết
 # > Bật `Internet: On` trong Settings **đòi xác thực số điện thoại**. Chưa xác
@@ -97,6 +166,9 @@ log(f"bảng      : {len(meta):,}   câu hỏi: {len(questions)}")
 import socket
 import urllib.request
 
+from transformers import AutoConfig
+
+
 def check_net(host="huggingface.co", timeout=8) -> bool:
     try:
         socket.gethostbyname(host)
@@ -107,53 +179,51 @@ def check_net(host="huggingface.co", timeout=8) -> bool:
         return False
 
 
-HAS_NET = check_net()
-log(f"internet  : {'OK' if HAS_NET else 'CHẶN — bật Internet:On + xác thực SĐT'}")
-
-# Danh sách model theo thứ tự ưu tiên. Pooling KHÁC NHAU giữa các họ — dùng sai
-# kiểu pooling làm hỏng toàn bộ chất lượng mà không có dấu hiệu gì.
-EMB_CANDIDATES = [
-    # (tên, số chiều dùng, kiểu pooling, có instruct prefix ở phía query?)
-    ("Qwen/Qwen3-Embedding-4B",      1024, "last",  True),
-    ("Qwen/Qwen3-Embedding-0.6B",    1024, "last",  True),
-    ("BAAI/bge-m3",                  1024, "cls",   False),
-    ("AITeamVN/Vietnamese_Embedding", 1024, "cls",  False),
-]
-
-
-def resolve_model():
-    """Thử từng ứng viên, in LỖI THẬT (transformers bọc lại thành OSError chung chung)."""
-    from transformers import AutoConfig
-    for name, dim, pool, pref in EMB_CANDIDATES:
-        try:
-            cfg = AutoConfig.from_pretrained(name)
-            log(f"  OK   {name}  (hidden={getattr(cfg, 'hidden_size', '?')}, "
-                f"pool={pool})")
-            return name, dim, pool, pref
-        except Exception as e:                                  # noqa: BLE001
-            log(f"  FAIL {name}: {type(e).__name__}: {str(e)[:160]}")
+if not check_net():
     raise RuntimeError(
-        "Không tải được model nào. Kiểm tra: (1) Internet: On trong Settings, "
-        "(2) đã xác thực số điện thoại Kaggle, (3) transformers đủ mới "
-        "— chạy `!pip install -q -U transformers` rồi Restart Session.")
+        "Không có internet. Settings → Internet: On, và phải đã xác thực số "
+        "điện thoại Kaggle. Bật xong nhớ Restart Session.")
+log("internet  : OK")
 
-
-EMB_MODEL, EMB_DIM, EMB_POOL, EMB_PREFIX = resolve_model()
-log(f"dùng      : {EMB_MODEL}  dim={EMB_DIM}  pool={EMB_POOL}")
+for name in (EMB_MODEL, RERANK_MODEL):
+    # In lỗi THẬT: transformers bọc mọi thứ thành OSError chung chung, đọc vào
+    # tưởng sai tên model trong khi thực ra là mạng hoặc transformers quá cũ.
+    try:
+        cfg = AutoConfig.from_pretrained(name)
+        log(f"  OK   {name}  (hidden={getattr(cfg, 'hidden_size', '?')})")
+    except Exception as e:                                      # noqa: BLE001
+        raise RuntimeError(
+            f"Không đọc được config của {name}: {type(e).__name__}: {e}\n"
+            "Nếu lỗi nhắc tới kiến trúc lạ: !pip install -q -U transformers "
+            "rồi Restart Session.") from e
 
 # %% [markdown]
-# ## 1b — Embed 146.246 passage
-#
-# `EMB_DIM = 1024`: với Qwen3-Embedding đây là Matryoshka (cắt 2560 → 1024, gần
-# như không mất chất lượng); với bge-m3 thì 1024 đã là chiều gốc. Index 300 MB
-# thay vì 748 MB, vừa một Kaggle Dataset.
+# ## 2 — Embed 146.246 passage
 #
 # Passage do `src/passages.py` dựng sẵn: metadata + caption + header + nhãn dòng.
 # **Không** embed toàn bộ ô — con số không mang thông tin truy xuất, chỉ gây nhiễu.
+#
+# Model nạp **một lần** rồi giữ nguyên trong VRAM để dùng tiếp cho phía query ở
+# cell 3 — nạp lại 8 GB weights lần nữa là phí vài phút mà không được gì.
 
 # %%
-BATCH, MAXLEN = 24, 384
-EMB_PATH = OUT / "table_emb.f16.npy"
+from transformers import AutoModel, AutoTokenizer  # noqa: E402
+
+_emb_bundle = None
+
+
+def load_embedder():
+    """Nạp bi-encoder một lần duy nhất cho cả passage lẫn query."""
+    global _emb_bundle
+    if _emb_bundle is None:
+        log(f"tải {EMB_MODEL} …")
+        tok = AutoTokenizer.from_pretrained(
+            EMB_MODEL, padding_side="left" if EMB_POOL == "last" else "right")
+        model = AutoModel.from_pretrained(
+            EMB_MODEL, torch_dtype=torch.float16).cuda().eval()
+        _emb_bundle = (tok, model)
+        log(f"đã tải · VRAM {torch.cuda.memory_allocated()/1e9:.1f} GB")
+    return _emb_bundle
 
 
 def pool_hidden(h, mask, how: str):
@@ -170,14 +240,7 @@ if EMB_PATH.exists():
     emb = np.load(EMB_PATH)
     log(f"dùng lại embedding có sẵn: {emb.shape}")
 else:
-    from transformers import AutoModel, AutoTokenizer
-
-    log(f"tải {EMB_MODEL} …")
-    tok = AutoTokenizer.from_pretrained(
-        EMB_MODEL, padding_side="left" if EMB_POOL == "last" else "right")
-    model = AutoModel.from_pretrained(EMB_MODEL, torch_dtype=torch.float16).cuda().eval()
-    log(f"đã tải · VRAM {torch.cuda.memory_allocated()/1e9:.1f} GB")
-
+    tok, model = load_embedder()
     passages = meta["passage"].tolist()
     emb = np.zeros((len(passages), EMB_DIM), dtype=np.float16)
     t0 = time.time()
@@ -186,6 +249,8 @@ else:
             b = tok(passages[i:i + BATCH], padding=True, truncation=True,
                     max_length=MAXLEN, return_tensors="pt").to("cuda")
             v = pool_hidden(model(**b).last_hidden_state, b["attention_mask"], EMB_POOL)
+            # Cắt Matryoshka TRƯỚC rồi mới chuẩn hoá — đảo thứ tự là vector không
+            # còn norm 1 và cosine sai lệch.
             v = torch.nn.functional.normalize(v[:, :EMB_DIM].float(), dim=-1)
             emb[i:i + BATCH] = v.half().cpu().numpy()
             if (i // BATCH) % 250 == 0 and i:
@@ -194,12 +259,9 @@ else:
                     f"ETA {(len(passages)-i)/rate/60:.0f} phút)")
     np.save(EMB_PATH, emb)
     log(f"embed xong: {emb.shape} → {EMB_PATH.stat().st_size/1e6:.0f} MB")
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
 
 # %% [markdown]
-# ## 2 — Cross-encoder reranker
+# ## 3 — Cross-encoder reranker
 #
 # Bước ROI cao nhất của cả khâu retrieval: mentor đo **63,90 % → 80,19 %** chỉ nhờ
 # thêm rerank. Lý do: bi-encoder nén cả bảng vào MỘT vector, còn cross-encoder đọc
@@ -207,33 +269,15 @@ else:
 # "cho vay khách hàng **ngành Thương mại**": phải phân biệt dòng ngành với dòng tổng.
 
 # %%
-from transformers import (AutoModel, AutoModelForSequenceClassification,  # noqa: E402
-                          AutoTokenizer)
+from transformers import AutoModelForSequenceClassification  # noqa: E402
 
-RERANK_CANDIDATES = ["BAAI/bge-reranker-v2-m3",       # 568M, đa ngữ, ổn định sm75
-                     "AITeamVN/Vietnamese_Reranker",
-                     "BAAI/bge-reranker-base"]
+log(f"tải {RERANK_MODEL} …")
+rr_tok = AutoTokenizer.from_pretrained(RERANK_MODEL)
+rr_model = (AutoModelForSequenceClassification
+            .from_pretrained(RERANK_MODEL, torch_dtype=torch.float16).cuda().eval())
 
-rr_tok = rr_model = None
-for name in RERANK_CANDIDATES:
-    try:
-        log(f"tải {name} …")
-        rr_tok = AutoTokenizer.from_pretrained(name)
-        rr_model = (AutoModelForSequenceClassification
-                    .from_pretrained(name, torch_dtype=torch.float16).cuda().eval())
-        RERANK_MODEL = name
-        break
-    except Exception as e:                                      # noqa: BLE001
-        log(f"  FAIL {name}: {type(e).__name__}: {str(e)[:140]}")
-if rr_model is None:
-    raise RuntimeError("Không tải được reranker nào — xem lại Internet/SĐT ở cell 1a")
-log(f"reranker  : {RERANK_MODEL}")
-
-log(f"tải lại {EMB_MODEL} cho phía query …")
-q_tok = AutoTokenizer.from_pretrained(
-    EMB_MODEL, padding_side="left" if EMB_POOL == "last" else "right")
-q_model = AutoModel.from_pretrained(EMB_MODEL, torch_dtype=torch.float16).cuda().eval()
-log(f"VRAM {torch.cuda.memory_allocated()/1e9:.1f} GB")
+q_tok, q_model = load_embedder()      # đã nằm sẵn trong VRAM nếu vừa embed xong
+log(f"hai model đã sẵn sàng · VRAM {torch.cuda.memory_allocated()/1e9:.1f} GB")
 
 
 @torch.inference_mode()
@@ -258,7 +302,7 @@ def rerank(query: str, passages: list[str], batch: int = 12) -> np.ndarray:
     return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
 
 # %% [markdown]
-# ## 3 — Chạy 1.012 câu → `rerank_cache.parquet`
+# ## 4 — Chạy 1.012 câu → `rerank_cache.parquet`
 #
 # Luồng: **lọc metadata → dense top-50 → rerank → top-10**.
 # Lọc metadata trước là bắt buộc — nó thu 146k bảng xuống vài trăm, nếu không
@@ -310,7 +354,7 @@ cache.to_parquet(OUT / "rerank_cache.parquet", compression="zstd", index=False)
 log(f"ghi {OUT/'rerank_cache.parquet'}  ({len(cache):,} dòng)")
 
 # %% [markdown]
-# ## 4 — Log tổng kết & đối chiếu với tầng lexical
+# ## 5 — Log tổng kết & đối chiếu với tầng lexical
 #
 # Không có nhãn gold nên không đo được recall trực tiếp. Nhưng đo được **mức độ
 # đồng thuận** giữa hai tầng: nếu dense/rerank trùng BM25 gần hết thì nó không
@@ -318,6 +362,8 @@ log(f"ghi {OUT/'rerank_cache.parquet'}  ({len(cache):,} dòng)")
 
 # %%
 log("=" * 72)
+log(f"embedder             : {EMB_MODEL}")
+log(f"reranker             : {RERANK_MODEL}")
 log(f"câu xử lý            : {cache.qid.nunique()}/{len(questions)}")
 log(f"câu không lọc được doc: {n_global}")
 log(f"bảng/câu sau rerank   : {len(cache)/max(cache.qid.nunique(),1):.1f}")
@@ -325,6 +371,15 @@ log(f"section top-1         : "
     f"{cache[cache['rank']==0].section.value_counts().to_dict()}")
 log(f"rerank_score top-1    : trung vị {cache[cache['rank']==0].rerank_score.median():.3f} "
     f"· p10 {cache[cache['rank']==0].rerank_score.quantile(.1):.3f}")
+
+# Nhả VRAM trước khi đối chiếu — phần dưới chỉ chạy CPU. Viết theo kiểu chạy lại
+# được nhiều lần: `del` thẳng sẽ NameError ở lần chạy thứ hai, còn đặt lại
+# _emb_bundle = None để load_embedder() nạp lại sạch nếu cần quay lên cell trên.
+globals().pop("rr_model", None)
+globals().pop("q_model", None)
+_emb_bundle = None
+gc.collect()
+torch.cuda.empty_cache()
 
 try:
     from retrieval import retrieve
@@ -343,6 +398,8 @@ except Exception as e:                                          # noqa: BLE001
     log(f"bỏ qua đối chiếu lexical: {type(e).__name__}: {e}")
 
 log("=" * 72)
-log("XONG. Tải 2 file ở Output rồi bỏ vào artifacts/ ở máy local:")
-log("   rerank_cache.parquet   ← bắt buộc, bật tầng hybrid RRF")
-log("   table_emb.f16.npy      ← tuỳ chọn, để chạy lại không phải embed lần nữa")
+log("XONG. Tải file ở tab Output về máy local:")
+log("   rerank_cache.parquet → artifacts/ rồi COMMIT ⇒ hybrid RRF bật ở mọi nơi")
+log("   table_emb.f16.npy    → artifacts/ nhưng ĐỪNG commit (300 MB, GitHub chặn")
+log("                          file >100 MB; .gitignore đã chặn sẵn). Chỉ để chạy")
+log("                          lại notebook này mà không phải embed lần nữa.")
