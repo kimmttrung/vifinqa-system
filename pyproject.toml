@@ -1,0 +1,55 @@
+[project]
+name = "vifinqa-system"
+version = "1.0.0"
+description = "Financial Table Retrieval & Text-to-Pandas Query Generation (ViFinQA)"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas==3.0.5",
+    "pyarrow==25.0.1",
+    "numpy==2.5.2",
+    "scipy==1.18.0",
+    "tabulate==0.10.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Layout phẳng: 17 module top-level trong src/, không có package con.
+py-modules = [
+    "bm25",
+    "common",
+    "companies",
+    "corpus",
+    "docfilter",
+    "emit",
+    "execute",
+    "factlookup",
+    "facts",
+    "grids",
+    "locate",
+    "passages",
+    "prompt",
+    "qparse",
+    "retrieval",
+    "solve",
+    "submit",
+]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 96
+target-version = "py311"
+src = ["src", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

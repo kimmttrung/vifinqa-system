@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CẢNH BÁO: KHÔNG BAO GIỜ thêm pattern `ViFinQA/` vào file này.
+# Git trên Windows bật core.ignorecase, nên `ViFinQA/` sẽ khớp luôn
+# thư mục source và làm biến mất toàn bộ source code khỏi repo.
+# Dataset nằm NGOÀI repo (thư mục anh em) nên vốn dĩ không cần ignore.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Sinh lại được từ corpus bằng scripts/build_*.py — không commit
+artifacts/
+out/
+kaggle_bundle/
+
+# Notebook .ipynb sinh từ .py bằng scripts/py2ipynb.py
+notebooks/*.ipynb
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Môi trường
+venv/
+.venv/
+env/
+.env
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+CALUDE.md
+
