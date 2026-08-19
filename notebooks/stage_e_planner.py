@@ -59,13 +59,16 @@
 # nhưng chạy được. `enforce_eager=True` để tránh lỗi CUDA-graph capture trên Turing.
 
 # %%
+import gc
 import json
 import os
+import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from pathlib import Path
 
 import pandas as pd
@@ -349,7 +352,13 @@ def extract_code(text: str) -> str:
     return (m.group(1) if m else text).strip()
 
 
-_frame_cache: dict[str, pd.DataFrame] = {}
+# Cache CÓ TRẦN. Bản đầu là dict không giới hạn: nó giữ mọi DataFrame đã đọc,
+# mà bài nộp nền có ~5.000 CSV và mỗi câu dùng ~5,3 cái ⇒ tới cuối lượt 0 nó ôm
+# gần như toàn bộ. Cộng với vLLM là hết RAM host — đã làm kernel chết ở giây
+# 17.007 (4,7 giờ) trong lần chạy 19/08. LRU 192 phần tử đủ để các câu cùng một
+# công ty dùng lại nhau, mà bộ nhớ thì có trần.
+FRAME_CACHE_MAX = 192
+_frame_cache: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
 
 
 def frames_for(rec: dict) -> dict:
@@ -358,10 +367,32 @@ def frames_for(rec: dict) -> dict:
         f = BASE / e["csv_path"]
         if not f.exists():
             continue
-        if e["csv_path"] not in _frame_cache:
-            _frame_cache[e["csv_path"]] = pd.read_csv(f)
-        out[e["variable"]] = _frame_cache[e["csv_path"]].copy()
+        k = e["csv_path"]
+        if k in _frame_cache:
+            _frame_cache.move_to_end(k)
+        else:
+            _frame_cache[k] = pd.read_csv(f)
+            while len(_frame_cache) > FRAME_CACHE_MAX:
+                _frame_cache.popitem(last=False)
+        out[e["variable"]] = _frame_cache[k].copy()
     return out
+
+
+def ram_gb() -> float:
+    """RAM tiến trình đang dùng (GB). Kaggle T4×2 cho ~29 GB, vLLM ăn ~4–6 GB."""
+    try:
+        for line in pathlib.Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1e6
+    except Exception:                                       # noqa: BLE001
+        pass
+    return float("nan")
+
+
+def append_jsonl(path: pathlib.Path, rows: list[dict]) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
 def n_tokens(s: str) -> int:
@@ -382,64 +413,97 @@ def build_chat(rec, ir) -> tuple[str, list[dict], str]:
     return chat, ev, how
 
 
-patched, pending, journal = {}, list(targets), []
+# Chia lô + ghi dần. Bản đầu gom cả 1.012 prompt vào một lời gọi generate() rồi
+# chỉ ghi file ở cell cuối — kernel chết giữa chừng là mất sạch 4,7 giờ. Giờ mỗi
+# lô ghi ngay, và chạy lại thì đọc file cũ để bỏ qua câu đã xong.
+CHUNK = 128
+PATCH_PATH = OUT / "llm_patch.jsonl"
+LOG_PATH = OUT / "llm_log.jsonl"
+
+patched: dict[int, dict] = {}
+if PATCH_PATH.exists():
+    for line in PATCH_PATH.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            d = json.loads(line)
+            patched[int(d["id"])] = d
+    log(f"chạy tiếp từ lần trước: đã có sẵn {len(patched)} câu trong {PATCH_PATH.name}")
+
+pending = [(rec, ir) for rec, ir in targets if rec["id"] not in patched]
+journal: list[dict] = []
 shrunk = Counter()
+
 for attempt, temp in enumerate([0.0, 0.35, 0.35]):
     if not pending:
         break
     log(f"── lượt {attempt} (T={temp}) trên {len(pending)} câu ──")
-    prompts, keep = [], []
-    for rec, ir in pending:
-        pr, ev, how = build_chat(rec, ir)
-        shrunk[how] += 1
-        prompts.append(pr)
-        keep.append(({**rec, "evidence": ev}, ir))
-    if attempt == 0:
-        log(f"   thu nhỏ prompt: {dict(shrunk.most_common())}")
-
     sp = SamplingParams(temperature=temp, top_p=0.95 if temp else 1.0,
                         max_tokens=800, seed=attempt,
                         stop=["```\n\n", "\n\n\n"])
-    outs = llm.generate(prompts, sp)
-
     still, n_ok, n_none, n_err = [], 0, 0, 0
-    for (rec, ir), o in zip(keep, outs):
-        code = extract_code(o.outputs[0].text)
-        res = run_query(code, frames_for(rec), timeout=8.0)
-        if res.ok:
-            patched[rec["id"]] = {
-                "id": rec["id"], "answer": res.value, "pandas_query": code,
-                "attempt": attempt, "rule_answer": rec["answer"],
-                # Danh sách CSV ĐÚNG THỨ TỰ mà mô hình đã nhìn thấy khi viết code.
-                # apply_llm.py đối chiếu với bài ở local rồi mới dám chạy — chốt
-                # chặn duy nhất cho kiểu sai "df1 trỏ sang bảng khác".
-                "evidence": [e["csv_path"] for e in rec["evidence"]],
-            }
-            n_ok += 1
-            journal.append({"id": rec["id"], "attempt": attempt, "status": "ok",
-                            "answer": res.value, "rule_answer": rec["answer"],
-                            "code": code})
-        else:
-            still.append((rec, ir))
-            if "None" in str(res.error) or res.raw is None:
-                n_none += 1
+
+    for start in range(0, len(pending), CHUNK):
+        batch = pending[start:start + CHUNK]
+        prompts, keep = [], []
+        for rec, ir in batch:
+            pr, ev, how = build_chat(rec, ir)
+            shrunk[how] += 1
+            prompts.append(pr)
+            keep.append(({**rec, "evidence": ev}, ir))
+
+        outs = llm.generate(prompts, sp)
+
+        new_patch, new_log = [], []
+        for (rec, ir), o in zip(keep, outs):
+            code = extract_code(o.outputs[0].text)
+            res = run_query(code, frames_for(rec), timeout=8.0)
+            if res.ok:
+                row = {
+                    "id": rec["id"], "answer": res.value, "pandas_query": code,
+                    "attempt": attempt, "rule_answer": rec["answer"],
+                    # Danh sách CSV ĐÚNG THỨ TỰ mà mô hình đã nhìn thấy khi viết
+                    # code. apply_llm.py đối chiếu với bài ở local rồi mới dám
+                    # chạy — chốt chặn cho kiểu sai "df1 trỏ sang bảng khác".
+                    "evidence": [e["csv_path"] for e in rec["evidence"]],
+                }
+                patched[rec["id"]] = row
+                new_patch.append(row)
+                n_ok += 1
+                new_log.append({"id": rec["id"], "attempt": attempt, "status": "ok",
+                                "answer": res.value, "rule_answer": rec["answer"],
+                                "code": code})
             else:
-                n_err += 1
-            journal.append({"id": rec["id"], "attempt": attempt, "status": "fail",
-                            "error": res.error, "code": code[:400]})
-    log(f"   nhận {n_ok} · lỗi {n_err} · trả None {n_none} · còn lại {len(still)}")
+                still.append((rec, ir))
+                if "None" in str(res.error) or res.raw is None:
+                    n_none += 1
+                else:
+                    n_err += 1
+                new_log.append({"id": rec["id"], "attempt": attempt, "status": "fail",
+                                "error": res.error, "code": code[:400]})
+
+        append_jsonl(PATCH_PATH, new_patch)      # ← ghi NGAY, không đợi cell cuối
+        append_jsonl(LOG_PATH, new_log)
+        journal.extend(new_log)
+        del outs, prompts, keep, new_patch, new_log
+        gc.collect()
+        log(f"   lô {start//CHUNK + 1}/{-(-len(pending)//CHUNK)}: "
+            f"nhận {n_ok} · lỗi {n_err} · None {n_none} · RAM {ram_gb():.1f} GB")
+
+    log(f"   lượt {attempt} xong: nhận {n_ok} · lỗi {n_err} · trả None {n_none} "
+        f"· còn lại {len(still)}")
+    if attempt == 0:
+        log(f"   thu nhỏ prompt: {dict(shrunk.most_common())}")
     pending = still
 
 # %% [markdown]
 # ## 5 — Ghi kết quả + log toàn hệ thống
 
 # %%
+# Ghi đè bằng bản đã gộp: file .jsonl ở trên được nối dần theo lô, nên nếu bạn
+# chạy tiếp một session dở thì nó có thể chứa nhiều dòng cho cùng một id. Ở đây
+# dedupe theo id (bản mới nhất thắng) để bài nộp gọn.
 with (OUT / "llm_patch.jsonl").open("w", encoding="utf-8") as f:
     for v in patched.values():
         f.write(json.dumps(v, ensure_ascii=False) + "\n")
-with (OUT / "llm_log.jsonl").open("w", encoding="utf-8") as f:
-    for j in journal:
-        f.write(json.dumps(j, ensure_ascii=False) + "\n")
 
 conflict = [(i, v["rule_answer"], v["answer"]) for i, v in patched.items()
             if v["rule_answer"] and abs(v["answer"] - v["rule_answer"])
@@ -455,8 +519,84 @@ for i, ra, la in conflict[:20]:
     log(f"    q{i}: rule={ra!r}  llm={la!r}")
 log(f"→ {OUT/'llm_patch.jsonl'}   (mang về local)")
 log(f"→ {OUT/'llm_log.jsonl'}     (mọi lần sinh code, kể cả lỗi)")
+# %% [markdown]
+# ## 6 — Đóng gói `submission.zip` NGAY TẠI ĐÂY
+#
+# Repo đã clone sẵn trong session, bài nộp nền cũng dựng tại chỗ, nên không có lý
+# do gì phải mang `llm_patch.jsonl` về local rồi mới ráp. Cell này làm đúng việc
+# `scripts/apply_llm.py` làm, chỉ khác là chạy luôn trên Kaggle:
+#
+# 1. lấy `submission.json` của bài nền (đầy đủ `relevant_docs`/`relevant_tables`/`evidence`)
+# 2. với mỗi câu LLM giải được: **chạy lại code trong sandbox** rồi mới nhận
+# 3. câu nào lỗi thì giữ nguyên đáp án tất định
+# 4. ghi `submission.json` + `data/*.csv` + zip
+#
+# Bước 2 là chỗ không được bỏ: LLM chỉ sinh **code**, con số luôn do executor
+# chạy ra. Đó là lá chắn chống bịa số, và cũng là thứ giữ Execution Accuracy.
+#
+# Tải mỗi `submission.zip` ở tab Output là nộp được. Vẫn nên tải kèm
+# `llm_log.jsonl` để soi câu hỏng.
+
+# %%
+from submit import Record, Submission          # noqa: E402
+from execute import verify                     # noqa: E402
+
+SUB_DIR = OUT / "submission"
+records = json.loads((BASE / "submission.json").read_text(encoding="utf-8"))
+
+applied = rejected = mismatch = 0
+conflicts: list[tuple[int, float, float]] = []
+for r in records:
+    pt = patched.get(r["id"])
+    if not pt:
+        continue
+    local_ev = [e["csv_path"] for e in r["evidence"]]
+    seen_ev = pt.get("evidence")
+    if seen_ev is not None and local_ev[:len(seen_ev)] != list(seen_ev):
+        mismatch += 1                     # bài nền đã đổi so với lúc sinh code
+        continue
+    res = verify(pt["pandas_query"], {e["variable"]: e["csv_path"] for e in r["evidence"]},
+                 BASE)
+    if not res.ok:
+        rejected += 1
+        continue
+    ra = r["answer"]
+    r["answer"] = float(res.value)
+    r["pandas_query"] = pt["pandas_query"]
+    applied += 1
+    if ra and abs(res.value - ra) > 0.02 * abs(ra):
+        conflicts.append((r["id"], float(ra), float(res.value)))
+
+# Thư mục data/ phải đi cùng: pandas_query chạy trên chính các CSV này.
+if SUB_DIR.exists():
+    shutil.rmtree(SUB_DIR)
+SUB_DIR.mkdir(parents=True)
+shutil.copytree(BASE / "data", SUB_DIR / "data")
+
+s = Submission(SUB_DIR)
+for r in records:
+    s.add(Record(id=r["id"], question=r["question"], answer=r["answer"],
+                 relevant_docs=r["relevant_docs"], relevant_tables=r["relevant_tables"],
+                 evidence=r["evidence"], pandas_query=r["pandas_query"]))
+errs = s.validate()
+zpath = s.zip()
+
+log("=" * 72)
+log(f"vá {applied} câu · từ chối {rejected} (code chạy lỗi) · "
+    f"bỏ qua {mismatch} (evidence lệch bài nền) · lỗi format {len(errs)}")
+log(f"lệch >2% so với rule: {len(conflicts)}  ← soi tay nhóm này trước khi nộp")
+for qid, ra, la in conflicts[:15]:
+    log(f"    q{qid}: rule={ra!r}  llm={la!r}")
+for e in errs[:10]:
+    log(f"    {e}")
+log(f"→ {zpath}   ({zpath.stat().st_size/1e6:.1f} MB)  ← TẢI CÁI NÀY RỒI NỘP")
+
+# %%
 log("=" * 72)
 log("Ở máy local chạy:")
+log("   (chỉ cần nếu bạn muốn vá lên một bài nộp DỰNG Ở LOCAL — ví dụ bài có")
+log("    --ce-extra mà bài nền trên Kaggle không có. Còn nếu nộp thẳng zip ở")
+log("    cell 6 thì bỏ qua bước này.)")
 log(f"   python scripts/apply_llm.py --sub out/<bài dựng bằng {' '.join(BASE_ARGS)}>"
     f" --patch llm_patch.jsonl --out out/v6")
 log("   → out/v5/submission.zip   (mỗi câu vá vào đều được chạy lại sandbox ở local)")
