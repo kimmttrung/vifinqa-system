@@ -99,8 +99,6 @@ def _rerank_cache():
     Không có file ⇒ chạy thuần lexical. Nhờ vậy máy không GPU vẫn chạy được toàn
     bộ pipeline.
     """
-    if hybrid_weight() <= 0:
-        return None
     p = ARTIFACTS / "rerank_cache.parquet"
     if not p.exists():
         return None
@@ -232,7 +230,7 @@ def retrieve(ir: QueryIR, k_read: int = 10, k_submit: int | None = None,
     lex_rank = {int(t[2]): rank for rank, t in enumerate(scored)}
     rr = _rerank_cache()
     ce = (rr or {}).get(ir.qid) or {}
-    if ce:
+    if ce and hybrid_weight() > 0:
         ce_rank = {row: rank for row, (rank, _) in ce.items() if row in lex_rank}
         fused = rrf(lex_rank, ce_rank, weights=(1.0, hybrid_weight()))
         order = sorted(fused, key=lambda r: -fused[r])
@@ -269,6 +267,55 @@ def retrieve(ir: QueryIR, k_read: int = 10, k_submit: int | None = None,
                 "rrf_score": round(fused[int(row)], 6) if fused else None,
                 "fusion": "rrf(lex,ce)" if ce else "lex_only",
             }))
+    return out
+
+
+def ce_extra_hits(ir: QueryIR, n: int, exclude: set[tuple[str, int]]) -> list[Hit]:
+    """n bảng hạng cao nhất của cross-encoder mà tập nộp lexical CHƯA có.
+
+    ## Vì sao CỘNG THÊM chứ không TRỘN
+
+    Trộn RRF thì bảng CE **đẩy** bảng lexical ra khỏi tập nộp — đo 19/08: thay
+    ~58% tập nộp, TABLES_F2 0,4137 → 0,3293. Cộng thêm thì tập lexical đã đo được
+    giữ nguyên, chỉ nới k. Rủi ro chỉ còn ở precision, và F₂ tính rất rẻ:
+
+        F₂ = 5h/(4G + k)   ⇒   nới k lên k+1 có lãi khi   p > h/(4G + k)
+
+    Với h ≈ 1,7 · G ≈ 2,15 · k = 6:  p > 1,7/(8,6+6) = **11,6%**. Nghĩa là bảng
+    thêm vào chỉ cần đúng 1 lần trong 9 là đã hoà. Một cross-encoder dù tầm thường
+    cũng thường vượt ngưỡng đó, miễn là nó ĐỘC LẬP với lexical — mà Jaccard(lex,ce)
+    = 0,215 nói đúng là độc lập.
+
+    Khác biệt then chốt so với fusion: cách này **không bao giờ bỏ** bảng nào
+    lexical đã chọn, nên RECALL chỉ có thể tăng. Nhưng F₂ thì KHÔNG có sàn:
+    k nằm ở mẫu, nên nếu bảng thêm vào không trúng lần nào (p = 0) thì
+
+        5h/(4G+8) vs 5h/(4G+6)  ⇒  tụt ~12% tương đối.
+
+    Đây là một CƯỢC có ngưỡng rõ ràng (p > 11,6%), không phải bữa trưa miễn phí.
+    """
+    if n <= 0:
+        return []
+    rr = _rerank_cache()
+    ce = (rr or {}).get(ir.qid) or {}
+    if not ce:
+        return []
+    meta, _, _, _, _ = _load()
+    out: list[Hit] = []
+    for row, (rank, score) in sorted(ce.items(), key=lambda kv: kv[1][0]):
+        m = meta.iloc[int(row)]
+        key = (m.doc_id, int(m.table_idx))
+        if key in exclude:
+            continue
+        out.append(Hit(
+            row=int(row), doc_id=m.doc_id, table_idx=int(m.table_idx),
+            score=0.0, section=m.section, caption=m.caption,
+            line_no=m.line_no, page_no=m.page_no, char_start=m.char_start,
+            reasons={"source": "ce_extra", "ce_rank": rank,
+                     "ce_score": round(float(score), 4)}))
+        exclude.add(key)
+        if len(out) >= n:
+            break
     return out
 
 

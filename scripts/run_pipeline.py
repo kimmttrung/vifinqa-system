@@ -30,7 +30,7 @@ from docfilter import filter_docs
 from execute import verify
 from grids import load_grids
 from qparse import parse_question
-from retrieval import Hit, retrieve, select_submit
+from retrieval import Hit, ce_extra_hits, retrieve, select_submit
 from solve import solve
 from submit import Record, Submission
 
@@ -75,7 +75,7 @@ def _write_trace(out_dir: Path, plans, sub, args) -> Path:
         raise TypeError(type(o).__name__)
 
     with p.open("w", encoding="utf-8") as f:
-        for ir, docs, hits, sel, fhits, sol in plans:
+        for ir, docs, hits, sel, fhits, sol, cex in plans:
             rec = by_id.get(ir.qid)
             selected = {(h.doc_id, h.table_idx) for h in sel}
             row = {
@@ -152,15 +152,17 @@ def build(args) -> int:
         # solve() phải chạy ở ĐÂY chứ không ở pha sau: nó tham chiếu những bảng
         # mà retrieval có thể không trả về, và pha nạp lưới cần biết trước.
         sol = solve(ir) if (use_facts and not args.no_solver) else None
-        plans.append((ir, docs, hits, sel, fhits, sol))
+        cex = ce_extra_hits(ir, args.ce_extra,
+                            {(h.doc_id, h.table_idx) for h in sel})
+        plans.append((ir, docs, hits, sel, fhits, sol, cex))
         if n % 100 == 0:
             print(f"    {n}/{len(questions)} · {time.time()-t0:.0f}s", flush=True)
 
     # nạp lưới cho cả các bảng CHỈ dùng để dò ô (hạng 2,3…) chứ không nộp:
     # relevant_tables tối ưu F₂ nên hẹp, còn cell grounding cần rộng.
     keys = {(h.doc_id, h.table_idx)
-            for _, _, hits, sel, fh, sol in plans
-            for h in (list(hits[:args.k_probe]) + list(sel) + list(fh)
+            for _, _, hits, sel, fh, sol, cex in plans
+            for h in (list(hits[:args.k_probe]) + list(sel) + list(fh) + list(cex)
                       + (list(sol.facts) if sol else []))}
     print(f"[2/4] nạp lưới cho {len(keys)} bảng…", flush=True)
     grids = load_grids(keys)
@@ -177,7 +179,7 @@ def build(args) -> int:
             written[key] = name
         return f"data/{written[key]}"
 
-    for ir, docs, hits, sel, fhits, sol in plans:
+    for ir, docs, hits, sel, fhits, sol, cex in plans:
         if not sel and not fhits:
             stats["no_hit"] += 1
             sub.add(Record(id=ir.qid, question=ir.question, answer=0.0,
@@ -217,6 +219,13 @@ def build(args) -> int:
                             refs.extend(emit.table_refs(h, args.position_scheme,
                                                         args.doc_id_scheme))
                             extra_docs.append(h.doc_id)
+                    for h in cex:               # bảng CE cộng thêm, không thay
+                        if (h.doc_id, h.table_idx) in seen:
+                            continue
+                        seen[(h.doc_id, h.table_idx)] = h
+                        refs.extend(emit.table_refs(h, args.position_scheme,
+                                                    args.doc_id_scheme))
+                        extra_docs.append(h.doc_id)
                     ranked = list(dict.fromkeys(extra_docs + [h.doc_id for h in hits] + docs))
                     sub.add(Record(
                         id=ir.qid, question=ir.question, answer=float(sol.value),
@@ -277,6 +286,10 @@ def build(args) -> int:
                            + [h for h in submit_hits
                               if not (extra and h.doc_id == extra.doc_id
                                       and h.table_idx == extra.table_idx)])
+
+        have = {(h.doc_id, h.table_idx) for h in submit_hits}
+        submit_hits = submit_hits + [h for h in cex
+                                     if (h.doc_id, h.table_idx) not in have]
 
         evidence, refs = [], []
         for j, h in enumerate(submit_hits, 1):
@@ -369,6 +382,9 @@ def main() -> int:
     ap.add_argument("--position-scheme", default="line_no",
                     choices=[*emit.POSITION_SCHEMES, "all"])
     ap.add_argument("--doc-id-scheme", default="folder", choices=emit.DOC_ID_SCHEMES)
+    ap.add_argument("--ce-extra", type=int, default=0,
+                    help="nối thêm N bảng hạng cao của cross-encoder mà lexical bỏ "
+                         "sót. KHÔNG thay bảng nào — sàn kết quả là cấu hình lexical")
     ap.add_argument("--ce-weight", type=float, default=0.0,
                     help="trọng số tầng dense/rerank trong RRF (0 = tắt, mặc định). "
                          "Đo 19/08: bật ngang hàng làm TABLES_F2 tụt 0,4137 → 0,3293")
