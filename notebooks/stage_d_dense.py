@@ -58,6 +58,7 @@
 
 # %%
 import gc
+import json
 import os
 import subprocess
 import sys
@@ -201,6 +202,26 @@ log(f"bảng      : {len(meta):,}   câu hỏi: {len(questions)}   "
 #
 # Dùng sai kiểu pooling **không báo lỗi** — nó chỉ làm chất lượng tụt âm thầm.
 #
+# ### `QUERY_TEXT = "raw"` — câu hỏi nguyên văn, không phải `retrieval_query`
+#
+# `ir.retrieval_query` được thiết kế cho **BM25**: `fold()` bỏ dấu, viết hoa, bỏ mã
+# CK, bỏ tên công ty, bỏ năm. Với BM25 thì đúng (OCR sai dấu liên tục, tên công ty
+# có trong caption của mọi bảng nên không phân biệt được gì). Nhưng đưa chuỗi đó
+# cho model neural là **sai miền dữ liệu**:
+#
+# | | Văn bản đưa vào |
+# |---|---|
+# | Câu hỏi gốc | `Lãi tiền gửi năm 2018 của công ty mẹ CTCP Hàng không Vietjet (VJC) là bao nhiêu triệu đồng?` |
+# | `retrieval_query` | `LAI TIEN GUI NAM HANG` |
+#
+# Mất dấu, mất năm, `Hàng không` teo còn `HANG`. Đo trên `rerank_cache.parquet` của
+# lần chạy đầu: logit top-1 trung vị **−4,09** — tức cross-encoder cho rằng ứng viên
+# TỐT NHẤT vẫn là không liên quan. RRF chỉ dùng thứ hạng nên không sập, nhưng thứ
+# hạng đó kém hơn nhiều so với khả năng thật của model.
+#
+# Tầng lexical trong `src/retrieval.py` **vẫn dùng `retrieval_query`** — không đổi.
+# Chỉ hai tầng neural ở notebook này đổi sang câu hỏi thô.
+#
 # `EMB_DIM = 1024`: với Qwen3-Embedding đây là Matryoshka (cắt 2560 → 1024, gần
 # như không mất chất lượng); index còn 300 MB thay vì 748 MB, vừa một Kaggle Dataset.
 
@@ -212,11 +233,17 @@ EMB_DIM = 1024                           # Matryoshka: cắt từ hidden_size g�
 
 RERANK_MODEL = "BAAI/bge-reranker-v2-m3"  # 568M, đa ngữ, chạy ổn trên sm75
 
+# "raw"  = nguyên văn câu hỏi, CÒN DẤU        ← khuyên dùng cho model neural
+# "bm25" = ir.retrieval_query (đã fold, bỏ dấu, bỏ tên công ty & năm)
+QUERY_TEXT = "raw"
+
 BATCH, MAXLEN = 24, 384
 EMB_PATH = OUT / "table_emb.f16.npy"
+EMB_SIDECAR = OUT / "table_emb.meta.json"
 
 log(f"embedder  : {EMB_MODEL}  (pool={EMB_POOL}, dim={EMB_DIM})")
 log(f"reranker  : {RERANK_MODEL}")
+log(f"query     : {QUERY_TEXT}")
 
 # %% [markdown]
 # ## 1a — PREFLIGHT: kiểm tra mạng + hai model TRƯỚC khi làm việc nặng
@@ -305,9 +332,42 @@ def pool_hidden(h, mask, how: str):
     return h[torch.arange(h.size(0), device=h.device), idx]
 
 
-if EMB_PATH.exists():
-    emb = np.load(EMB_PATH)
-    log(f"dùng lại embedding có sẵn: {emb.shape}")
+def find_cached_emb() -> Path | None:
+    """table_emb.f16.npy của lần chạy trước: /kaggle/working → artifacts/ → Dataset.
+
+    Kaggle xoá sạch /kaggle/working giữa các session, nên nếu chỉ nhìn ở đó thì
+    LẦN NÀO CŨNG phải embed lại 2–3 giờ. File 285 MB không commit lên GitHub được
+    (giới hạn 100 MB), nên đường tái dùng thật sự là up nó thành Kaggle Dataset
+    rồi + Add Input.
+    """
+    for c in (EMB_PATH, ARTIFACTS / "table_emb.f16.npy"):
+        if c.exists():
+            return c
+    return find_under(KAGGLE_INPUT, "table_emb.f16.npy") if IN_KAGGLE else None
+
+
+def emb_is_usable(path: Path) -> bool:
+    """Kiểm shape + model đã sinh ra nó. Dùng nhầm embedding của model khác thì
+    cosine vẫn tính được, không lỗi gì cả — chỉ là kết quả rác."""
+    shape = np.load(path, mmap_mode="r").shape
+    if shape != (len(meta), EMB_DIM):
+        log(f"  bỏ qua {path}: shape {shape} ≠ {(len(meta), EMB_DIM)}")
+        return False
+    side = path.with_name("table_emb.meta.json")
+    if side.exists():
+        info = json.loads(side.read_text(encoding="utf-8"))
+        if info.get("model") != EMB_MODEL:
+            log(f"  bỏ qua {path}: sinh bởi {info.get('model')}, không phải {EMB_MODEL}")
+            return False
+        return True
+    log(f"  {path} không có sidecar → không kiểm được model, tin theo shape")
+    return True
+
+
+_cached = find_cached_emb()
+if _cached and emb_is_usable(_cached):
+    emb = np.load(_cached)
+    log(f"dùng lại embedding có sẵn: {emb.shape}  ({_cached})")
 else:
     tok, model = load_embedder()
     passages = meta["passage"].tolist()
@@ -327,7 +387,12 @@ else:
                 log(f"  embed {i:,}/{len(passages):,}  ({rate:.0f} passage/s, "
                     f"ETA {(len(passages)-i)/rate/60:.0f} phút)")
     np.save(EMB_PATH, emb)
+    EMB_SIDECAR.write_text(json.dumps(
+        {"model": EMB_MODEL, "dim": EMB_DIM, "rows": len(emb), "maxlen": MAXLEN},
+        ensure_ascii=False), encoding="utf-8")
     log(f"embed xong: {emb.shape} → {EMB_PATH.stat().st_size/1e6:.0f} MB")
+    log(f"  sidecar {EMB_SIDECAR.name}: tải VỀ CÙNG file .npy, nó là thứ chặn việc"
+        f" dùng nhầm embedding của model khác")
 
 # %% [markdown]
 # ## 3 — Cross-encoder reranker
@@ -395,13 +460,14 @@ for n, q in enumerate(questions, 1):
         rows = np.arange(len(meta))       # câu không nêu công ty nào
         n_global += 1
 
-    qv = embed_query(ir.retrieval_query)
+    qtext = q["question"] if QUERY_TEXT == "raw" else ir.retrieval_query
+    qv = embed_query(qtext)
     sims = emb_f32[rows] @ qv
     take = np.argsort(-sims)[:K_DENSE]
     cand = [int(rows[i]) for i in take]
     dense_score = {int(rows[i]): float(sims[i]) for i in take}
 
-    scores = rerank(ir.retrieval_query, [passages_all[r] for r in cand])
+    scores = rerank(qtext, [passages_all[r] for r in cand])
     order = np.argsort(-scores)[:K_KEEP]
     for rank, i in enumerate(order):
         r = cand[int(i)]
@@ -438,8 +504,12 @@ log(f"câu không lọc được doc: {n_global}")
 log(f"bảng/câu sau rerank   : {len(cache)/max(cache.qid.nunique(),1):.1f}")
 log(f"section top-1         : "
     f"{cache[cache['rank']==0].section.value_counts().to_dict()}")
-log(f"rerank_score top-1    : trung vị {cache[cache['rank']==0].rerank_score.median():.3f} "
+_med = cache[cache['rank'] == 0].rerank_score.median()
+log(f"rerank_score top-1    : trung vị {_med:.3f} "
     f"· p10 {cache[cache['rank']==0].rerank_score.quantile(.1):.3f}")
+log("   logit của bge-reranker: >0 nghĩa là 'liên quan'. Trung vị top-1 mà ÂM SÂU"
+    " (< −3) là dấu hiệu câu truy vấn sai miền — kiểm lại QUERY_TEXT."
+    if _med < -3 else "   trung vị top-1 dương ⇒ câu truy vấn đúng miền dữ liệu")
 
 # Nhả VRAM trước khi đối chiếu — phần dưới chỉ chạy CPU. Viết theo kiểu chạy lại
 # được nhiều lần: `del` thẳng sẽ NameError ở lần chạy thứ hai, còn đặt lại
