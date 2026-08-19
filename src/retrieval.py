@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 
@@ -68,13 +69,38 @@ def _load():
 RRF_K = 60          # hằng số làm mềm của Reciprocal Rank Fusion
 
 
+def hybrid_weight() -> float:
+    """Trọng số của tầng dense/rerank trong RRF. 0 = tắt hẳn (mặc định).
+
+    ĐỌC KỸ TRƯỚC KHI BẬT. Có file `rerank_cache.parquet` KHÔNG có nghĩa là nên
+    dùng. Lần đo đầu tiên (19/08) cho thấy nó làm hại:
+
+        lexical thuần   TABLES_F2 0,4137  ·  P 0,2796  ·  R 0,6099
+        + rerank 50-50  TABLES_F2 0,3293  ·  P 0,2042  ·  R 0,4942
+
+    Nguyên nhân: notebook Stage D+ cấp cho cross-encoder chuỗi `retrieval_query`
+    (đã fold, bỏ dấu, bỏ tên công ty, bỏ năm) — thứ dành cho BM25, sai miền với
+    model neural. Logit top-1 trung vị −4,09 tức "không liên quan".
+
+    Vì vậy mặc định TẮT. Bật lại bằng `--ce-weight 0.5` (hoặc env VIFINQA_CE_WEIGHT)
+    sau khi đã chạy lại Stage D+ với `QUERY_TEXT = "raw"`, và chỉ giữ nếu
+    leaderboard nói nó hơn 0,4137.
+    """
+    try:
+        return max(0.0, float(os.environ.get("VIFINQA_CE_WEIGHT", "0")))
+    except ValueError:
+        return 0.0
+
+
 @lru_cache(maxsize=1)
 def _rerank_cache():
     """`artifacts/rerank_cache.parquet` do notebook Kaggle sinh (dense + rerank).
 
     Không có file ⇒ chạy thuần lexical. Nhờ vậy máy không GPU vẫn chạy được toàn
-    bộ pipeline, và khi có file thì chỉ cần copy vào artifacts/ là hybrid bật lên.
+    bộ pipeline.
     """
+    if hybrid_weight() <= 0:
+        return None
     p = ARTIFACTS / "rerank_cache.parquet"
     if not p.exists():
         return None
@@ -86,18 +112,26 @@ def _rerank_cache():
     return out
 
 
-def rrf(*rank_maps: dict[int, int], k: int = RRF_K) -> dict[int, float]:
-    """Reciprocal Rank Fusion: score(d) = Σᵢ 1/(k + rankᵢ(d) + 1).
+def rrf(*rank_maps: dict[int, int], k: int = RRF_K,
+        weights: tuple[float, ...] | None = None) -> dict[int, float]:
+    """Reciprocal Rank Fusion có trọng số: score(d) = Σᵢ wᵢ/(k + rankᵢ(d) + 1).
 
     Vì sao RRF chứ không cộng điểm thô: BM25 (0..~30), cosine (−1..1) và logit
     của cross-encoder (−10..10) ở ba thang hoàn toàn khác nhau — cộng thẳng là
     để một nguồn nuốt hai nguồn kia. RRF chỉ dùng THỨ HẠNG nên miễn nhiễm với
     thang đo và với outlier.
+
+    Trọng số có mặt vì RRF cân bằng KHÔNG phải lúc nào cũng đúng: đo trên
+    leaderboard 19/08, hợp nhất 50-50 với một cross-encoder được cấp câu truy vấn
+    sai miền làm TABLES_F2 tụt 0,4137 → 0,3293. Một nguồn nhiễu trộn ngang hàng
+    thì kéo cả kết quả xuống, nên nguồn chưa chứng minh được phải vào với trọng
+    số nhỏ hơn.
     """
     out: dict[int, float] = {}
-    for rm in rank_maps:
+    for i, rm in enumerate(rank_maps):
+        w = 1.0 if weights is None else weights[i]
         for row, rank in rm.items():
-            out[row] = out.get(row, 0.0) + 1.0 / (k + rank + 1)
+            out[row] = out.get(row, 0.0) + w / (k + rank + 1)
     return out
 
 
@@ -200,7 +234,7 @@ def retrieve(ir: QueryIR, k_read: int = 10, k_submit: int | None = None,
     ce = (rr or {}).get(ir.qid) or {}
     if ce:
         ce_rank = {row: rank for row, (rank, _) in ce.items() if row in lex_rank}
-        fused = rrf(lex_rank, ce_rank)
+        fused = rrf(lex_rank, ce_rank, weights=(1.0, hybrid_weight()))
         order = sorted(fused, key=lambda r: -fused[r])
     else:
         fused = {}

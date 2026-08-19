@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from collections import Counter
@@ -368,7 +369,13 @@ def main() -> int:
     ap.add_argument("--position-scheme", default="line_no",
                     choices=[*emit.POSITION_SCHEMES, "all"])
     ap.add_argument("--doc-id-scheme", default="folder", choices=emit.DOC_ID_SCHEMES)
-    return build(ap.parse_args())
+    ap.add_argument("--ce-weight", type=float, default=0.0,
+                    help="trọng số tầng dense/rerank trong RRF (0 = tắt, mặc định). "
+                         "Đo 19/08: bật ngang hàng làm TABLES_F2 tụt 0,4137 → 0,3293")
+    args = ap.parse_args()
+    # đặt TRƯỚC khi retrieval.py nạp cache — _rerank_cache() có lru_cache
+    os.environ["VIFINQA_CE_WEIGHT"] = str(args.ce_weight)
+    return build(args)
 
 
 if __name__ == "__main__":
