@@ -420,6 +420,12 @@ CHUNK = 128
 PATCH_PATH = OUT / "llm_patch.jsonl"
 LOG_PATH = OUT / "llm_log.jsonl"
 
+# Trần thời gian sinh code. Kaggle giết session GPU ở 9 giờ, và khi chạy ở chế độ
+# "Save & Run All" mà bị giết thì file trong /kaggle/working THƯỜNG KHÔNG được
+# lưu — mất sạch, không chạy tiếp được. Nên tự dừng sớm rồi đóng gói phần đã có,
+# vì bài nộp có 60% câu do LLM giải vẫn tốt hơn không có bài nộp nào.
+TIME_BUDGET_S = float(os.environ.get("VIFINQA_TIME_BUDGET", 7.5 * 3600))
+
 patched: dict[int, dict] = {}
 if PATCH_PATH.exists():
     for line in PATCH_PATH.read_text(encoding="utf-8").splitlines():
@@ -442,6 +448,12 @@ for attempt, temp in enumerate([0.0, 0.35, 0.35]):
     still, n_ok, n_none, n_err = [], 0, 0, 0
 
     for start in range(0, len(pending), CHUNK):
+        if time.time() - T_START > TIME_BUDGET_S:
+            log(f"   ⏰ chạm trần {TIME_BUDGET_S/3600:.1f} giờ — dừng sinh code, "
+                f"đóng gói phần đã có ({len(patched)} câu)")
+            still.extend(pending[start:])
+            break
+
         batch = pending[start:start + CHUNK]
         prompts, keep = [], []
         for rec, ir in batch:
@@ -450,7 +462,16 @@ for attempt, temp in enumerate([0.0, 0.35, 0.35]):
             prompts.append(pr)
             keep.append(({**rec, "evidence": ev}, ir))
 
-        outs = llm.generate(prompts, sp)
+        # Một lô hỏng (OOM, lỗi kernel CUDA) không được phép giết cả run: phần đã
+        # ghi ra .jsonl vẫn còn, và cell đóng gói phía dưới vẫn chạy được.
+        try:
+            outs = llm.generate(prompts, sp)
+        except Exception as e:                              # noqa: BLE001
+            log(f"   ✗ lô {start//CHUNK + 1} hỏng: {type(e).__name__}: {str(e)[:200]}")
+            still.extend(batch)
+            del prompts, keep
+            gc.collect()
+            continue
 
         new_patch, new_log = [], []
         for (rec, ir), o in zip(keep, outs):
@@ -543,6 +564,17 @@ from execute import verify                     # noqa: E402
 
 SUB_DIR = OUT / "submission"
 records = json.loads((BASE / "submission.json").read_text(encoding="utf-8"))
+
+# Đọc lại từ .jsonl thay vì tin biến `patched` trong bộ nhớ: nếu bạn chạy lẻ cell
+# này sau khi kernel chết, hoặc chạy tiếp một session dở, thì file mới là nguồn
+# đầy đủ. Câu nào LLM chưa giải được thì giữ nguyên đáp án tất định — bài nộp
+# LUÔN hợp lệ, kể cả khi mới vá được một phần.
+if PATCH_PATH.exists():
+    for line in PATCH_PATH.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            d = json.loads(line)
+            patched[int(d["id"])] = d
+log(f"số câu LLM giải được: {len(patched)}/{len(records)}")
 
 applied = rejected = mismatch = 0
 conflicts: list[tuple[int, float, float]] = []
