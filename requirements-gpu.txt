@@ -1,7 +1,10 @@
 # Chỉ cho Stage D+ và Stage E trên Kaggle (T4). KHÔNG cần ở máy local.
-# Kaggle đã cài sẵn torch/transformers; chỉ pin những gì hay lệch.
+# Kaggle image có sẵn torch + transformers, nhưng KHÔNG có vllm — notebook
+# Stage E tự `pip install` ở cell 3a.
 torch>=2.1,<3
 transformers>=4.44
+# Ghim đúng bản đã chạy được sau lần chạy đầu (BTC yêu cầu tái lập được):
+# đọc dòng log `vllm X.Y.Z` ở cell 3a rồi sửa dòng dưới thành vllm==X.Y.Z
 vllm>=0.6.0        # Stage E — bắt buộc AWQ + dtype=half trên sm75 (Turing)
 sentencepiece
 accelerate

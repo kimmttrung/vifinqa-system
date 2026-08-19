@@ -257,7 +257,68 @@ _demo = build_prompt(_rec0, _ir0, BASE)
 log(f"prompt mẫu ({len(_demo)} ký tự):\n{'-'*72}\n{_demo[:1800]}\n{'-'*72}")
 
 # %% [markdown]
-# ## 3 — vLLM: Qwen 14B AWQ, tensor-parallel 2
+# ## 3a — Cài vLLM
+#
+# **Kaggle KHÔNG cài sẵn vLLM** — image chỉ có torch/transformers. Cell này cài
+# (~5–10 phút, ~2 GB) rồi kiểm ngay ba thứ hay hỏng, để bạn biết trong 1 phút thay
+# vì phát hiện sau khi đã chờ nạp model.
+#
+# Hai biến môi trường phải đặt **trước** khi `import vllm`, đặt sau là vô tác dụng:
+#
+# | Biến | Vì sao |
+# |---|---|
+# | `VLLM_WORKER_MULTIPROC_METHOD=spawn` | TP=2 phải fork worker; trong notebook, `fork` mặc định hay treo cứng vì tiến trình cha đã giữ CUDA context |
+# | `VLLM_USE_V1=0` | engine V1 nhắm vào sm80+; trên Turing (sm75) dùng V0 ổn định hơn |
+#
+# Nếu cài xong mà vẫn `ModuleNotFoundError`: **Run → Restart Session** rồi Run All
+# lại — pip đã thay gói ngay dưới chân tiến trình đang chạy.
+
+# %%
+VLLM_SPEC = os.environ.get("VIFINQA_VLLM_SPEC", "vllm")
+
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_USE_V1", "0")
+
+try:
+    import vllm                                          # noqa: F401
+except ModuleNotFoundError:
+    log(f"cài {VLLM_SPEC} … (5–10 phút, ~2 GB — bình thường)")
+    rc = subprocess.run([sys.executable, "-m", "pip", "install", "-q", VLLM_SPEC],
+                        capture_output=True, text=True)
+    print(rc.stdout[-1200:])
+    print(rc.stderr[-1200:])
+    try:
+        import vllm                                      # noqa: F401
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "Cài xong vẫn không import được vllm.\n"
+            "→ Run → Restart Session, rồi Run All lại (pip vừa thay gói dưới chân "
+            "tiến trình đang chạy nên nó chưa thấy)."
+        ) from e
+
+import torch                                             # noqa: E402
+
+cap = torch.cuda.get_device_capability(0)
+log(f"vllm {vllm.__version__} · torch {torch.__version__} · "
+    f"GPU sm{cap[0]}{cap[1]} ×{torch.cuda.device_count()}")
+
+if torch.cuda.device_count() < 2:
+    raise RuntimeError(
+        f"Chỉ thấy {torch.cuda.device_count()} GPU. 14B AWQ cần T4 ×2 "
+        "(Settings → Accelerator → GPU T4 x2). Muốn chạy 1 GPU thì đổi MODEL sang "
+        "bản 7B AWQ và TP=1 ở cell dưới.")
+if cap[0] < 8:
+    log("  sm<80: không bf16, không Marlin ⇒ bắt buộc dtype='half' + AWQ GEMM thường "
+        "(chậm hơn nhưng chạy được). Cell dưới đã đặt đúng.")
+
+# pip vừa có thể nâng/hạ numpy — mà phần sau còn cần pandas để đọc CSV bằng chứng.
+# Vỡ ở đây thì biết ngay, thay vì vỡ sau 2 giờ sinh code.
+import pandas as _pd                                     # noqa: E402
+_ = _pd.DataFrame({"x": [1.0]}).x.sum()
+log(f"pandas vẫn chạy sau khi cài: {_pd.__version__}")
+
+# %% [markdown]
+# ## 3b — vLLM: Qwen 14B AWQ, tensor-parallel 2
 
 # %%
 MODEL = os.environ.get("VIFINQA_LLM", "Qwen/Qwen2.5-14B-Instruct-AWQ")
