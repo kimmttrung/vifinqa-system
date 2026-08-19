@@ -35,13 +35,23 @@ def main() -> int:
             d = json.loads(line)
             patch[int(d["id"])] = d
 
-    applied = rejected = 0
+    applied = rejected = mismatch = 0
     conflicts: list[tuple[int, float, float]] = []
     for r in recs:
         p = patch.get(r["id"])
         if not p:
             continue
         paths = {e["variable"]: e["csv_path"] for e in r["evidence"]}
+        # LLM viết code theo df1..dfN của bài nền dựng trên Kaggle; ở đây ta chạy
+        # nó trên df1..dfN của bài local. Hai danh sách lệch thì code VẪN CHẠY,
+        # chỉ là đọc nhầm bảng — sandbox không bắt được, vì nó chỉ kiểm cú pháp
+        # và kiểu trả về. Nên phải so khớp tường minh trước khi chạy.
+        seen_ev = p.get("evidence")
+        if seen_ev is not None:
+            local = [e["csv_path"] for e in r["evidence"]]
+            if local[:len(seen_ev)] != list(seen_ev):
+                mismatch += 1
+                continue
         res = verify(p["pandas_query"], paths, sub_dir)
         if not res.ok:
             rejected += 1
@@ -74,7 +84,11 @@ def main() -> int:
     errs = s.validate()
     z = s.zip()
     print(f"vá {applied} câu · từ chối {rejected} (chạy lỗi ở local) · "
+          f"bỏ qua {mismatch} (evidence lệch bài nền) · "
           f"lỗi format {len(errs)} · lệch rule {len(conflicts)}")
+    if mismatch:
+        print(f"   ⚠ {mismatch} câu bị bỏ vì --sub không khớp BASE_ARGS của notebook."
+              f" Dựng lại submission bằng đúng cấu hình đó rồi vá lại.")
     for qid, ra, la in conflicts[:15]:
         print(f"   q{qid}: rule={ra!r} vs llm={la!r}")
     for e in errs[:10]:

@@ -73,6 +73,12 @@ import pandas as pd
 REPO_URL = "https://github.com/kimmttrung/vifinqa-system.git"
 REPO_BRANCH = "main"
 BASE_TAG = "base"
+# Cấu hình dựng bài nộp nền. PHẢI KHỚP với bài bạn sẽ vá ở local, vì LLM viết
+# code dựa trên df1..dfN của bài nền này, còn apply_llm.py lại chạy code đó trên
+# df1..dfN của bài ở local. Lệch nhau thì code vẫn chạy, chỉ là đọc nhầm bảng —
+# sai mà không có lỗi nào báo. (Riêng `--ce-extra` chỉ NỐI vào cuối nên df1..df6
+# giữ nguyên, vá chéo được; `--ce-weight` thì đảo cả thứ tự, không vá chéo được.)
+BASE_ARGS = ["--k-max", "6", "--adaptive-k"]
 
 T_START = time.time()
 IN_KAGGLE = Path("/kaggle/working").exists()
@@ -185,7 +191,7 @@ if not (BASE / "submission.json").exists():
     log(f"dựng bài nộp nền bằng run_pipeline.py (~4–8 phút) → {BASE}")
     rc = subprocess.run(
         [sys.executable, str(REPO / "scripts" / "run_pipeline.py"),
-         "--tag", BASE_TAG, "--k-max", "6", "--adaptive-k"],
+         "--tag", BASE_TAG, *BASE_ARGS],
         cwd=str(REPO), capture_output=True, text=True)
     print(rc.stdout[-2500:])
     if rc.returncode or not (BASE / "submission.json").exists():
@@ -193,7 +199,10 @@ if not (BASE / "submission.json").exists():
 
 records = json.loads((BASE / "submission.json").read_text(encoding="utf-8"))
 log(f"repo {REPO}  ·  base {BASE}  ·  {len(records)} câu")
-log(f"hybrid RRF: {'BẬT' if (REPO/'artifacts'/'rerank_cache.parquet').exists() else 'tắt (chưa có rerank_cache.parquet — chạy Stage D+ trước)'}")
+_ce = [a for a in BASE_ARGS if a.startswith("--ce-")]
+log(f"bài nền dựng bằng: {' '.join(BASE_ARGS)}"
+    + (f"  ⇒ có dùng cross-encoder ({', '.join(_ce)})" if _ce
+       else "  ⇒ lexical thuần (cross-encoder TẮT — đó là mặc định đã đo tốt nhất)"))
 
 # %% [markdown]
 # ## 1 — Chọn phạm vi
@@ -340,6 +349,10 @@ for attempt, temp in enumerate([0.0, 0.35, 0.35]):
             patched[rec["id"]] = {
                 "id": rec["id"], "answer": res.value, "pandas_query": code,
                 "attempt": attempt, "rule_answer": rec["answer"],
+                # Danh sách CSV ĐÚNG THỨ TỰ mà mô hình đã nhìn thấy khi viết code.
+                # apply_llm.py đối chiếu với bài ở local rồi mới dám chạy — chốt
+                # chặn duy nhất cho kiểu sai "df1 trỏ sang bảng khác".
+                "evidence": [e["csv_path"] for e in rec["evidence"]],
             }
             n_ok += 1
             journal.append({"id": rec["id"], "attempt": attempt, "status": "ok",
@@ -383,7 +396,8 @@ log(f"→ {OUT/'llm_patch.jsonl'}   (mang về local)")
 log(f"→ {OUT/'llm_log.jsonl'}     (mọi lần sinh code, kể cả lỗi)")
 log("=" * 72)
 log("Ở máy local chạy:")
-log("   python scripts/apply_llm.py --sub out/v4 --patch llm_patch.jsonl --out out/v5")
+log(f"   python scripts/apply_llm.py --sub out/<bài dựng bằng {' '.join(BASE_ARGS)}>"
+    f" --patch llm_patch.jsonl --out out/v6")
 log("   → out/v5/submission.zip   (mỗi câu vá vào đều được chạy lại sandbox ở local)")
 
 # %% [markdown]
