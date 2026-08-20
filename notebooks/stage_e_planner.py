@@ -613,7 +613,7 @@ for attempt, temp in enumerate(TEMPS):
         append_jsonl(PATCH_PATH, new_patch)      # ← ghi NGAY, không đợi cell cuối
         append_jsonl(LOG_PATH, new_log)
         journal.extend(new_log)
-        del outs, prompts, keep, codes, results, new_patch, new_log
+        del outs, prompts, keep, checks, results, new_patch, new_log
         gc.collect()
         log(f"   lô {start//CHUNK + 1}/{-(-len(pending)//CHUNK)}: "
             f"nhận {n_ok} · lỗi {n_err} · None {n_none} · guard {n_guard} · RAM {ram_gb():.1f} GB")
