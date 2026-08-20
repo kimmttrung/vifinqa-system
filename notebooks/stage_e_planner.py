@@ -352,16 +352,37 @@ log(f"prompt mẫu ({len(_demo)} ký tự):\n{'-'*72}\n{_demo[:1800]}\n{'-'*72}"
 # | Biến | Vì sao |
 # |---|---|
 # | `VLLM_WORKER_MULTIPROC_METHOD=spawn` | TP=2 phải fork worker; trong notebook, `fork` mặc định hay treo cứng vì tiến trình cha đã giữ CUDA context |
-# | `VLLM_USE_V1=0` | engine V1 nhắm vào sm80+; trên Turing (sm75) dùng V0 ổn định hơn |
+# | `VLLM_USE_V1=0` | engine V1 nhắm vào sm80+; trên Turing (sm75) dùng V0 ổn định hơn. **Chỉ còn tác dụng với vLLM ≤ 0.9** — bản mới bỏ hẳn V0 và im lặng bỏ qua biến này, cell 3a sẽ ghi rõ khi điều đó xảy ra |
+#
+# `VIFINQA_VLLM_SPEC` = ghim phiên bản (vd `vllm==0.6.3.post1`). Image Kaggle đã
+# có sẵn vLLM nên biến này **cài đè**, không phải "cài nếu thiếu"; đặt xong phải
+# Restart Session vì bản cũ đã nằm trong bộ nhớ tiến trình.
 #
 # Nếu cài xong mà vẫn `ModuleNotFoundError`: **Run → Restart Session** rồi Run All
 # lại — pip đã thay gói ngay dưới chân tiến trình đang chạy.
 
 # %%
-VLLM_SPEC = os.environ.get("VIFINQA_VLLM_SPEC", "vllm")
+VLLM_SPEC = os.environ.get("VIFINQA_VLLM_SPEC", "")
 
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_USE_V1", "0")
+
+# Image Kaggle CÓ SẴN vllm (`/usr/local/lib/python3.12/dist-packages/vllm`), nên
+# nhánh `except ModuleNotFoundError` bên dưới gần như không bao giờ chạy — và
+# `VIFINQA_VLLM_SPEC` trước đây vì thế là vô hiệu, kể cả khi bản có sẵn hỏng trên
+# sm75. Đặt biến đó = ghim phiên bản ⇒ cài đè, có sẵn hay không cũng cài.
+if VLLM_SPEC:
+    log(f"ghim {VLLM_SPEC} (cài đè bản có sẵn) …")
+    rc = subprocess.run([sys.executable, "-m", "pip", "install", "-q", VLLM_SPEC],
+                        capture_output=True, text=True)
+    print(rc.stdout[-1200:])
+    print(rc.stderr[-1200:])
+    if "vllm" in sys.modules:
+        raise RuntimeError(
+            "Đã cài đè vLLM nhưng tiến trình này còn giữ bản cũ trong bộ nhớ.\n"
+            "→ Run → Restart Session, rồi Run All lại.")
+else:
+    VLLM_SPEC = "vllm"
 
 try:
     import vllm                                          # noqa: F401
@@ -382,18 +403,93 @@ except ModuleNotFoundError:
 
 import torch                                             # noqa: E402
 
-cap = torch.cuda.get_device_capability(0)
-log(f"vllm {vllm.__version__} · torch {torch.__version__} · "
-    f"GPU sm{cap[0]}{cap[1]} ×{torch.cuda.device_count()}")
 
-if torch.cuda.device_count() < 2:
+def gpu_table() -> list[dict]:
+    """Trạng thái GPU đọc qua `nvidia-smi` — KHÔNG chạm CUDA ở tiến trình này.
+
+    `torch.cuda.get_device_capability()` khởi tạo CUDA context **ngay trong tiến
+    trình notebook** (~300–500 MB trên GPU 0). Tiền kiểm mà làm vậy thì nó ăn mất
+    đúng phần headroom mà worker cần, và vì `gpu_memory_utilization` tính theo
+    TỔNG bộ nhớ chứ không phải phần còn trống, worker xin 0,90×15 GB rồi chết
+    lúc init — đúng kiểu `WorkerProc initialization failed` không nói lý do.
+    """
+    q = "index,compute_cap,memory.total,memory.used"
+    rc = subprocess.run(["nvidia-smi", f"--query-gpu={q}",
+                         "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True)
+    out = []
+    for line in rc.stdout.strip().splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) < 4:
+            continue
+        out.append({"idx": int(f[0]), "cap": f[1],
+                    "total_mb": float(f[2]), "used_mb": float(f[3])})
+    return out
+
+
+def gpu_procs() -> list[str]:
+    rc = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory",
+                         "--format=csv,noheader"], capture_output=True, text=True)
+    return [l.strip() for l in rc.stdout.strip().splitlines() if l.strip()]
+
+
+gpus = gpu_table()
+if not gpus:
+    raise RuntimeError("Không đọc được nvidia-smi — session này không có GPU. "
+                       "Settings → Accelerator → GPU T4 x2.")
+
+cap_major = int(gpus[0]["cap"].split(".")[0]) if "." in gpus[0]["cap"] else 7
+log(f"vllm {vllm.__version__} · torch {torch.__version__} · "
+    f"GPU sm{gpus[0]['cap'].replace('.', '')} ×{len(gpus)}")
+for g in gpus:
+    log(f"   GPU{g['idx']}: đang dùng {g['used_mb']:.0f} / {g['total_mb']:.0f} MB")
+
+if len(gpus) < 2:
     raise RuntimeError(
-        f"Chỉ thấy {torch.cuda.device_count()} GPU. 14B AWQ cần T4 ×2 "
+        f"Chỉ thấy {len(gpus)} GPU. 14B AWQ cần T4 ×2 "
         "(Settings → Accelerator → GPU T4 x2). Muốn chạy 1 GPU thì đổi MODEL sang "
         "bản 7B AWQ và TP=1 ở cell dưới.")
-if cap[0] < 8:
+if cap_major < 8:
     log("  sm<80: không bf16, không Marlin ⇒ bắt buộc dtype='half' + AWQ GEMM thường "
         "(chậm hơn nhưng chạy được). Cell dưới đã đặt đúng.")
+
+# Worker vLLM của một session TRƯỚC có thể còn sống và vẫn giữ VRAM: kernel chết
+# (hoặc bị Restart) không phải lúc nào cũng kéo theo tiến trình con `spawn`.
+# Session mới nạp lại model thì worker mới hết chỗ ⇒ chết lúc init.
+_busy = [g for g in gpus if g["used_mb"] > 1024]
+if _busy:
+    _procs = gpu_procs()
+    log(f"  ⚠ {len(_busy)} GPU đã bị chiếm >1 GB trước khi nạp model. "
+        f"Tiến trình đang giữ GPU: {_procs or 'không rõ'}")
+    log("    → Nếu là worker mồ côi của lần chạy trước: Run → Restart Session "
+        "(Factory reset nếu vẫn còn), rồi Run All lại.")
+
+# Chỉ xin phần CÒN TRỐNG, chừa 5% biên. gpu_memory_utilization của vLLM tính theo
+# TỔNG bộ nhớ, nên hằng số 0,90 chỉ đúng khi GPU hoàn toàn sạch — điều không đảm
+# bảo được trong notebook.
+_free_frac = min((g["total_mb"] - g["used_mb"]) / g["total_mb"] for g in gpus)
+
+# Sàn: 14B AWQ TP=2 cần ~4,6 GB trọng số + KV cache tối thiểu ≈ 9 GB trên T4 15 GB.
+# Dưới mức này thì hạ trần không cứu được — nạp thử vẫn chết, chỉ tốn vài phút một
+# lần. Chặn ngay và nói rõ phải làm gì.
+MIN_UTIL = 0.60
+if _free_frac * 0.95 < MIN_UTIL:
+    raise RuntimeError(
+        f"Chỉ còn {_free_frac*100:.0f}% VRAM trống — không đủ cho 14B AWQ TP=2 "
+        f"(cần ≥ {MIN_UTIL*100:.0f}%).\n"
+        f"Tiến trình đang giữ GPU: {gpu_procs() or 'không rõ'}\n"
+        "→ Run → Restart Session (Factory reset nếu vẫn còn), rồi Run All lại.")
+
+GPU_UTIL = float(os.environ.get("VIFINQA_GPU_UTIL", "0") or 0) or \
+    max(MIN_UTIL, min(0.90, _free_frac * 0.95))
+log(f"gpu_memory_utilization = {GPU_UTIL:.2f} (trống {_free_frac*100:.0f}%)")
+
+# `VLLM_USE_V1=0` chỉ có tác dụng với vLLM còn engine V0. Bản mới đã bỏ hẳn V0 và
+# lặng lẽ bỏ qua biến này — traceback vẫn hiện `vllm/v1/engine/core.py`. Ghi rõ ra
+# để không đi tìm nguyên nhân ở chỗ đã chết từ lâu.
+if os.environ.get("VLLM_USE_V1") == "0" and hasattr(vllm, "v1"):
+    log("  ghi chú: bản vLLM này không còn engine V0 ⇒ VLLM_USE_V1=0 là vô tác dụng, "
+        "vẫn chạy V1 trên sm75.")
 
 # pip vừa có thể nâng/hạ numpy — mà phần sau còn cần pandas để đọc CSV bằng chứng.
 # Vỡ ở đây thì biết ngay, thay vì vỡ sau 2 giờ sinh code.
@@ -410,10 +506,40 @@ MAX_LEN = 8192
 
 from vllm import LLM, SamplingParams      # noqa: E402
 
-log(f"nạp {MODEL} (AWQ, TP=2, dtype=half) …")
-llm = LLM(model=MODEL, dtype="half", quantization="awq", tensor_parallel_size=2,
-          max_model_len=MAX_LEN, gpu_memory_utilization=0.90,
-          enforce_eager=True, trust_remote_code=True)
+def load_llm(util: float):
+    return LLM(model=MODEL, dtype="half", quantization="awq", tensor_parallel_size=2,
+               max_model_len=MAX_LEN, gpu_memory_utilization=util,
+               enforce_eager=True, trust_remote_code=True)
+
+
+# Thang lùi. Chết lúc init gần như luôn là hết chỗ, mà lượng chỗ thiếu thì không
+# đoán trước được (context của tiến trình cha, worker mồ côi, phân mảnh). Thử lại
+# với trần thấp hơn rẻ hơn nhiều so với mất một session GPU 9 giờ.
+_LADDER = sorted({round(u, 2) for u in (GPU_UTIL, GPU_UTIL - 0.07, MIN_UTIL)
+                  if u >= MIN_UTIL}, reverse=True)      # phải ĐƠN ĐIỆU GIẢM
+
+llm, _err = None, None
+for _util in _LADDER:
+    log(f"nạp {MODEL} (AWQ, TP=2, dtype=half, util={_util:.2f}) …")
+    try:
+        llm = load_llm(_util)
+    except Exception as e:                                  # noqa: BLE001
+        _err = e
+        log(f"   ✗ hỏng: {type(e).__name__}: {str(e)[:300]}")
+        gc.collect()
+
+if llm is None:
+    raise RuntimeError(
+        "Không nạp được model sau 3 lần hạ gpu_memory_utilization.\n"
+        "Nguyên nhân THẬT không nằm trong traceback này — nó nằm ở các dòng "
+        "`(Worker_TP0 pid=…)` / `(VllmWorker …)` **phía trên**, do worker in ra "
+        "trước khi chết. Cuộn lên lấy đúng đoạn đó.\n"
+        "Hai thủ phạm hay gặp nhất:\n"
+        "  1. worker mồ côi của session trước còn giữ VRAM → Restart Session;\n"
+        "  2. vLLM quá mới bỏ sm75 → đặt VIFINQA_VLLM_SPEC='vllm==0.6.3.post1' "
+        "rồi Restart Session + Run All."
+    ) from _err
+
 tok = llm.get_tokenizer()
 log("mô hình sẵn sàng")
 
