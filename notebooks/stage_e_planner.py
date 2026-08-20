@@ -68,20 +68,47 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import Counter, OrderedDict
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 
 REPO_URL = "https://github.com/kimmttrung/vifinqa-system.git"
 REPO_BRANCH = "main"
-BASE_TAG = "base"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HAI NÚT DUY NHẤT CẦN CHỈNH
+#
+# Đường ống có 9 mắt xích (clone → artifacts → base → prompt → cài vLLM → nạp
+# model → sinh code → exec → đóng gói zip). Mắt xích cuối chỉ chạy sau ~4 giờ,
+# nên một lỗi ở đó đốt trọn một session GPU. Chạy thử vài câu trước là bắt buộc.
+#
+# 1) MAX_QUESTIONS — chỉ xử lý N câu ĐẦU của file câu hỏi. 0 = tất cả.
+#    Đây là cách nhanh nhất để chạy thử vì không cần đụng vào dữ liệu.
+#
+# 2) QUESTIONS_FILE — trỏ tới file câu hỏi khác (vd bản rút gọn bạn tự đẩy lên
+#    Kaggle Dataset). Để rỗng thì notebook TỰ TÌM, ưu tiên /kaggle/input trước
+#    repo — nên chỉ cần + Add Input dataset chứa questions.jsonl là nó dùng ngay.
+#
+# Hai nút này ĐỘC LẬP: đẩy file 20 câu lên dataset rồi để MAX_QUESTIONS = 0 thì
+# chạy đủ 20 câu; để MAX_QUESTIONS = 3 thì chỉ 3 câu đầu của file đó.
+# ══════════════════════════════════════════════════════════════════════════════
+MAX_QUESTIONS = int(os.environ.get("VIFINQA_MAX_QUESTIONS", "3"))
+QUESTIONS_FILE = os.environ.get("VIFINQA_QUESTIONS_FILE", "")
+
+N_FULL = 1012            # số câu của bộ đề đầy đủ — chỉ dùng để nhận biết lượt thật
+
 # Cấu hình dựng bài nộp nền. PHẢI KHỚP với bài bạn sẽ vá ở local, vì LLM viết
 # code dựa trên df1..dfN của bài nền này, còn apply_llm.py lại chạy code đó trên
 # df1..dfN của bài ở local. Lệch nhau thì code vẫn chạy, chỉ là đọc nhầm bảng —
 # sai mà không có lỗi nào báo. (Riêng `--ce-extra` chỉ NỐI vào cuối nên df1..df6
 # giữ nguyên, vá chéo được; `--ce-weight` thì đảo cả thứ tự, không vá chéo được.)
 BASE_ARGS = ["--k-max", "6", "--adaptive-k"]
+
+# Trần RAM cho mỗi tiến trình chạy code của LLM (xem src/sandbox.py). 4 GB dư
+# sức cho những CSV vài trăm dòng ở đây; code nào vượt là code hỏng, không phải
+# code cần nhiều bộ nhớ.
+SANDBOX_MEM_GB = float(os.environ.get("VIFINQA_SANDBOX_MEM_GB", "4"))
 
 T_START = time.time()
 IN_KAGGLE = Path("/kaggle/working").exists()
@@ -148,22 +175,59 @@ def resolve_artifacts(repo: Path) -> tuple[Path, str]:
         "  Cách 2: tạo Kaggle Dataset chứa artifacts/ rồi + Add Input vào notebook.")
 
 
-def resolve_questions(repo: Path, arti: Path) -> Path:
+def resolve_questions(repo: Path, arti: Path) -> tuple[Path, str]:
+    """→ (file câu hỏi, nguồn).  Thứ tự ưu tiên: chỉ định tay → Kaggle Dataset → repo.
+
+    Kaggle Dataset đứng TRƯỚC repo là cố ý, và ngược với `resolve_artifacts`.
+    Lý do: repo lúc nào cũng mang sẵn bộ 1.012 câu, nên nếu repo thắng thì file
+    rút gọn bạn đẩy lên Dataset sẽ không bao giờ được dùng — mà lại không có lỗi
+    nào báo ra, bạn chỉ thấy nó chạy 4 tiếng thay vì 5 phút.
+
+    Đổi lại, phải in rõ đang đọc file nào và bao nhiêu câu, vì giờ một Dataset
+    cũ còn đính kèm cũng đủ để đổi phạm vi chạy.
+    """
+    if QUESTIONS_FILE:
+        p = Path(QUESTIONS_FILE)
+        if not p.exists():
+            raise FileNotFoundError(f"QUESTIONS_FILE không tồn tại: {p}")
+        return p, "chỉ định tay (QUESTIONS_FILE)"
+    for name in ("questions.jsonl", "questions.json"):
+        hit = find_under(KAGGLE_INPUT, name)
+        if hit:
+            return hit, f"Kaggle Dataset ({hit})"
     for c in (repo / "questions" / "questions.jsonl",
               arti / "questions.jsonl",
               arti.parent / "questions" / "questions.jsonl"):
         if c.exists():
-            return c
-    hit = find_under(KAGGLE_INPUT, "questions.jsonl")
-    if hit:
-        return hit
+            return c, "repo (bộ đề đầy đủ)"
     raise FileNotFoundError("Không tìm thấy questions.jsonl (repo hoặc Kaggle Dataset)")
+
+
+def count_questions(p: Path) -> int:
+    """Đếm câu hỏi — chịu được cả .jsonl (một JSON/dòng) lẫn .json (một mảng)."""
+    txt = p.read_text(encoding="utf-8").strip()
+    if txt.startswith("["):
+        return len(json.loads(txt))
+    return sum(1 for line in txt.splitlines() if line.strip())
 
 
 REPO = get_repo()
 sys.path.insert(0, str(REPO / "src"))
 ARTI, ARTI_SRC = resolve_artifacts(REPO)
-QUES = resolve_questions(REPO, ARTI)
+QUES, QUES_SRC = resolve_questions(REPO, ARTI)
+N_Q_FILE = count_questions(QUES)
+# số câu THỰC SỰ chạy = min(file, trần MAX_QUESTIONS)
+N_EFF = min(N_Q_FILE, MAX_QUESTIONS) if MAX_QUESTIONS else N_Q_FILE
+TRIAL = N_EFF < N_FULL
+
+# Lượt chạy thử phải có thư mục nền và file kết quả RIÊNG. Cell dựng nền bỏ qua
+# khi đã thấy submission.json, nên dùng chung tên thì lượt chạy thật sau đó ăn
+# lại bài nền 3 câu mà không báo gì; còn llm_patch dùng chung thì lượt thật coi
+# mấy câu đã thử là "xong rồi" và bỏ qua. Cả hai đều hỏng im lặng.
+BASE_TAG = f"base_{N_EFF}" if TRIAL else "base"
+_SFX = f".{N_EFF}" if TRIAL else ""
+if MAX_QUESTIONS:
+    BASE_ARGS += ["--limit", str(N_EFF)]
 # Trỏ THẲNG bằng biến môi trường thay vì để common.py tự dò: hàm dò quét
 # /kaggle/input TRƯỚC, nên còn Dataset cũ đính kèm là nó nhặt nhầm bản cũ mà
 # không báo gì.
@@ -176,14 +240,24 @@ miss = [n for n in NEED if not (ARTI / n).exists()]
 if miss:
     raise FileNotFoundError(f"artifacts thiếu file: {miss}  (đang đọc {ARTI})")
 
-from execute import run_query                # noqa: E402
 from qparse import parse_question            # noqa: E402
+from sandbox import run_jobs                 # noqa: E402
 from common import ARTIFACTS                 # noqa: E402
 
 OUT = Path("/kaggle/working") if IN_KAGGLE else Path("out/llm")
 OUT.mkdir(parents=True, exist_ok=True)
+log("=" * 72)
+if TRIAL:
+    log(f"CHẠY THỬ — {N_EFF} câu (file có {N_Q_FILE}, trần MAX_QUESTIONS="
+        f"{MAX_QUESTIONS or 'không đặt'}).")
+    log("Mục đích: đi hết tới submission.zip ở cell 6 trong ~18 phút.")
+    log("Ra được zip rồi thì đặt MAX_QUESTIONS = 0 và dùng file đề đầy đủ.")
+else:
+    log(f"CHẠY THẬT — {N_EFF} câu. Dự kiến 3–4,5 giờ.")
+log("=" * 72)
 log(f"repo      : {REPO}")
 log(f"artifacts : {ARTIFACTS}   ← {ARTI_SRC}")
+log(f"câu hỏi   : {QUES}   ← {QUES_SRC}   ({N_Q_FILE} câu)")
 
 # ── bài nộp nền: dựng TẠI CHỖ bằng chính code vừa clone ──
 # Trước đây bước này giải nén một submission.zip upload sẵn. Bỏ đi vì bài nền
@@ -223,6 +297,9 @@ for r in records:
     if (LLM_SCOPE == "all" or hard) and r["evidence"]:
         targets.append((r, ir))
 
+# Không cần cắt lại ở đây: `records` đã đúng phạm vi vì bài nền được dựng bằng
+# --limit N_EFF trên chính file câu hỏi đã chọn. Cắt hai lần là chỗ để hai con
+# số lệch nhau mà không ai phát hiện.
 log(f"đưa vào LLM: {len(targets)}/{len(records)}  (scope={LLM_SCOPE})")
 log(f"  theo tier : {dict(sorted(Counter(ir.tier for _, ir in targets).items()))}")
 log(f"  theo đơn vị: {dict(Counter(ir.unit_kind for _, ir in targets).most_common())}")
@@ -352,30 +429,16 @@ def extract_code(text: str) -> str:
     return (m.group(1) if m else text).strip()
 
 
-# Cache CÓ TRẦN. Bản đầu là dict không giới hạn: nó giữ mọi DataFrame đã đọc,
-# mà bài nộp nền có ~5.000 CSV và mỗi câu dùng ~5,3 cái ⇒ tới cuối lượt 0 nó ôm
-# gần như toàn bộ. Cộng với vLLM là hết RAM host — đã làm kernel chết ở giây
-# 17.007 (4,7 giờ) trong lần chạy 19/08. LRU 192 phần tử đủ để các câu cùng một
-# công ty dùng lại nhau, mà bộ nhớ thì có trần.
-FRAME_CACHE_MAX = 192
-_frame_cache: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
-
-
-def frames_for(rec: dict) -> dict:
-    out = {}
-    for e in rec["evidence"]:
-        f = BASE / e["csv_path"]
-        if not f.exists():
-            continue
-        k = e["csv_path"]
-        if k in _frame_cache:
-            _frame_cache.move_to_end(k)
-        else:
-            _frame_cache[k] = pd.read_csv(f)
-            while len(_frame_cache) > FRAME_CACHE_MAX:
-                _frame_cache.popitem(last=False)
-        out[e["variable"]] = _frame_cache[k].copy()
-    return out
+# Code do LLM sinh KHÔNG bao giờ chạy trong tiến trình này nữa — nó đi qua
+# src/sandbox.py, tiến trình con có trần RAM. Nhờ vậy tiến trình notebook chỉ
+# còn giữ chuỗi và vLLM, không giữ DataFrame nào; cái cache LRU 192 phần tử
+# trước đây cũng không còn lý do tồn tại.
+def jobs_for(batch) -> list[dict]:
+    """[(rec, ir)] → job cho sandbox. csv_path tương đối, con tự nối với BASE."""
+    return [{"id": rec["id"], "code": code,
+             "frames": {e["variable"]: e["csv_path"] for e in rec["evidence"]
+                        if (BASE / e["csv_path"]).exists()}}
+            for rec, code in batch]
 
 
 def ram_gb() -> float:
@@ -417,14 +480,20 @@ def build_chat(rec, ir) -> tuple[str, list[dict], str]:
 # chỉ ghi file ở cell cuối — kernel chết giữa chừng là mất sạch 4,7 giờ. Giờ mỗi
 # lô ghi ngay, và chạy lại thì đọc file cũ để bỏ qua câu đã xong.
 CHUNK = 128
-PATCH_PATH = OUT / "llm_patch.jsonl"
-LOG_PATH = OUT / "llm_log.jsonl"
+# `_SFX` gắn số câu vào tên file khi chạy thử (xem cell đầu), để lượt thật không
+# ăn nhầm kết quả của lượt thử.
+PATCH_PATH = OUT / f"llm_patch{_SFX}.jsonl"
+LOG_PATH = OUT / f"llm_log{_SFX}.jsonl"
+# Code THÔ, ghi ngay khi model sinh xong và TRƯỚC khi đem đi chạy.
+RAW_PATH = OUT / f"llm_raw{_SFX}.jsonl"
 
 # Trần thời gian sinh code. Kaggle giết session GPU ở 9 giờ, và khi chạy ở chế độ
 # "Save & Run All" mà bị giết thì file trong /kaggle/working THƯỜNG KHÔNG được
 # lưu — mất sạch, không chạy tiếp được. Nên tự dừng sớm rồi đóng gói phần đã có,
 # vì bài nộp có 60% câu do LLM giải vẫn tốt hơn không có bài nộp nào.
 TIME_BUDGET_S = float(os.environ.get("VIFINQA_TIME_BUDGET", 7.5 * 3600))
+if TRIAL:
+    TIME_BUDGET_S = min(TIME_BUDGET_S, 1800.0)   # thử vài câu mà >30 phút là đã sai
 
 patched: dict[int, dict] = {}
 if PATCH_PATH.exists():
@@ -473,11 +542,26 @@ for attempt, temp in enumerate([0.0, 0.35, 0.35]):
             gc.collect()
             continue
 
+        codes = [extract_code(o.outputs[0].text) for o in outs]
+
+        # Ghi code thô TRƯỚC khi đem đi chạy. Thứ tự này là cả vấn đề: bước exec
+        # là chỗ đã giết kernel ở giờ thứ 4,24 hôm 20/08. Sandbox giờ chặn được
+        # cái chết đó, nhưng file này vẫn đáng có — mất kernel vì bất kỳ lý do
+        # nào khác thì token đã sinh vẫn còn, replay lại trên CPU vài phút.
+        append_jsonl(RAW_PATH, [
+            {"id": rec["id"], "attempt": attempt, "code": code,
+             "evidence": [e["csv_path"] for e in rec["evidence"]]}
+            for (rec, _ir), code in zip(keep, codes)])
+
+        # Chạy CẢ LÔ trong tiến trình con có trần RAM. Câu nào làm chết tiến
+        # trình con thì chỉ mình nó bị loại, kernel notebook không hề hấn gì.
+        results = run_jobs(jobs_for([(rec, c) for (rec, _ir), c in zip(keep, codes)]),
+                           BASE, mem_gb=SANDBOX_MEM_GB, timeout_s=8.0, log=log)
+
         new_patch, new_log = [], []
-        for (rec, ir), o in zip(keep, outs):
-            code = extract_code(o.outputs[0].text)
-            res = run_query(code, frames_for(rec), timeout=8.0)
-            if res.ok:
+        for (rec, ir), code in zip(keep, codes):
+            res = results.get(rec["id"])
+            if res is not None and res.ok:
                 row = {
                     "id": rec["id"], "answer": res.value, "pandas_query": code,
                     "attempt": attempt, "rule_answer": rec["answer"],
@@ -493,18 +577,19 @@ for attempt, temp in enumerate([0.0, 0.35, 0.35]):
                                 "answer": res.value, "rule_answer": rec["answer"],
                                 "code": code})
             else:
+                err = "không có kết quả trả về" if res is None else res.error
                 still.append((rec, ir))
-                if "None" in str(res.error) or res.raw is None:
+                if "không quy được về 1 số" in str(err):
                     n_none += 1
                 else:
                     n_err += 1
                 new_log.append({"id": rec["id"], "attempt": attempt, "status": "fail",
-                                "error": res.error, "code": code[:400]})
+                                "error": err, "code": code[:400]})
 
         append_jsonl(PATCH_PATH, new_patch)      # ← ghi NGAY, không đợi cell cuối
         append_jsonl(LOG_PATH, new_log)
         journal.extend(new_log)
-        del outs, prompts, keep, new_patch, new_log
+        del outs, prompts, keep, codes, results, new_patch, new_log
         gc.collect()
         log(f"   lô {start//CHUNK + 1}/{-(-len(pending)//CHUNK)}: "
             f"nhận {n_ok} · lỗi {n_err} · None {n_none} · RAM {ram_gb():.1f} GB")
@@ -522,7 +607,7 @@ for attempt, temp in enumerate([0.0, 0.35, 0.35]):
 # Ghi đè bằng bản đã gộp: file .jsonl ở trên được nối dần theo lô, nên nếu bạn
 # chạy tiếp một session dở thì nó có thể chứa nhiều dòng cho cùng một id. Ở đây
 # dedupe theo id (bản mới nhất thắng) để bài nộp gọn.
-with (OUT / "llm_patch.jsonl").open("w", encoding="utf-8") as f:
+with PATCH_PATH.open("w", encoding="utf-8") as f:
     for v in patched.values():
         f.write(json.dumps(v, ensure_ascii=False) + "\n")
 
@@ -538,8 +623,9 @@ log(f"không giải được    : {len(pending)} (giữ nguyên đáp án tất 
 log(f"lệch >2% so với rule: {len(conflict)}  ← soi tay nhóm này trước")
 for i, ra, la in conflict[:20]:
     log(f"    q{i}: rule={ra!r}  llm={la!r}")
-log(f"→ {OUT/'llm_patch.jsonl'}   (mang về local)")
-log(f"→ {OUT/'llm_log.jsonl'}     (mọi lần sinh code, kể cả lỗi)")
+log(f"→ {PATCH_PATH}   (mang về local)")
+log(f"→ {LOG_PATH}     (mọi lần sinh code, kể cả lỗi)")
+log(f"→ {RAW_PATH}     (code thô, ghi trước khi chạy — cứu cánh khi kernel chết)")
 # %% [markdown]
 # ## 6 — Đóng gói `submission.zip` NGAY TẠI ĐÂY
 #
@@ -560,7 +646,6 @@ log(f"→ {OUT/'llm_log.jsonl'}     (mọi lần sinh code, kể cả lỗi)")
 
 # %%
 from submit import Record, Submission          # noqa: E402
-from execute import verify                     # noqa: E402
 
 SUB_DIR = OUT / "submission"
 records = json.loads((BASE / "submission.json").read_text(encoding="utf-8"))
@@ -578,6 +663,11 @@ log(f"số câu LLM giải được: {len(patched)}/{len(records)}")
 
 applied = rejected = mismatch = 0
 conflicts: list[tuple[int, float, float]] = []
+
+# Cell này chạy LẠI toàn bộ code của LLM, nên nó cũng phải đi qua sandbox — nếu
+# không thì cái chết chỉ dời từ cell 4 xuống đây, và dời vào đúng chỗ đắt nhất:
+# ngay trước bước đóng gói, sau khi đã tiêu hết giờ GPU.
+todo = []
 for r in records:
     pt = patched.get(r["id"])
     if not pt:
@@ -587,14 +677,21 @@ for r in records:
     if seen_ev is not None and local_ev[:len(seen_ev)] != list(seen_ev):
         mismatch += 1                     # bài nền đã đổi so với lúc sinh code
         continue
-    res = verify(pt["pandas_query"], {e["variable"]: e["csv_path"] for e in r["evidence"]},
-                 BASE)
-    if not res.ok:
+    todo.append(r)
+
+results = run_jobs(
+    [{"id": r["id"], "code": patched[r["id"]]["pandas_query"],
+      "frames": {e["variable"]: e["csv_path"] for e in r["evidence"]}} for r in todo],
+    BASE, mem_gb=SANDBOX_MEM_GB, timeout_s=8.0, log=log)
+
+for r in todo:
+    res = results.get(r["id"])
+    if res is None or not res.ok:
         rejected += 1
         continue
     ra = r["answer"]
     r["answer"] = float(res.value)
-    r["pandas_query"] = pt["pandas_query"]
+    r["pandas_query"] = patched[r["id"]]["pandas_query"]
     applied += 1
     if ra and abs(res.value - ra) > 0.02 * abs(ra):
         conflicts.append((r["id"], float(ra), float(res.value)))
@@ -621,7 +718,15 @@ for qid, ra, la in conflicts[:15]:
     log(f"    q{qid}: rule={ra!r}  llm={la!r}")
 for e in errs[:10]:
     log(f"    {e}")
-log(f"→ {zpath}   ({zpath.stat().st_size/1e6:.1f} MB)  ← TẢI CÁI NÀY RỒI NỘP")
+if TRIAL:
+    log(f"→ {zpath}   ({zpath.stat().st_size/1e6:.1f} MB)")
+    log("=" * 72)
+    log(f"CHẠY THỬ ĐẠT: đường ống thông hết 9 mắt xích, ra zip {len(records)} câu.")
+    log("KHÔNG nộp file này — nó chỉ có một phần bộ đề.")
+    log("Chạy thật: đặt MAX_QUESTIONS = 0 và trỏ QUESTIONS_FILE/Dataset về bộ đủ.")
+    log("=" * 72)
+else:
+    log(f"→ {zpath}   ({zpath.stat().st_size/1e6:.1f} MB)  ← TẢI CÁI NÀY RỒI NỘP")
 
 # %%
 log("=" * 72)

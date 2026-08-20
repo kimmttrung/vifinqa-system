@@ -278,11 +278,23 @@ TABLE_LIGHT_COLS = [
 
 
 def load_questions() -> list[dict]:
+    """Đọc bộ câu hỏi. Nhận CẢ hai định dạng, phân biệt bằng ký tự đầu tiên:
+
+      · JSONL — một object mỗi dòng (bộ đề gốc của BTC)
+      · JSON  — một mảng `[{...}, {...}]`
+
+    Nhận mảng JSON vì bộ đề rút gọn dùng để chạy thử thường được xuất bằng
+    `json.dump(list)` rồi đẩy lên Kaggle Dataset. Không nhận thì lỗi rơi ra ở
+    tận `json.JSONDecodeError: Extra data` — chẳng gợi ý gì về nguyên nhân.
+    """
     p = _resolve_questions()
     if p is None:
         raise FileNotFoundError(
             "Không thấy questions/questions.jsonl. Set env VIFINQA_QUESTIONS trỏ tới file.")
-    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    txt = p.read_text(encoding="utf-8").strip()
+    if txt.startswith("["):
+        return json.loads(txt)
+    return [json.loads(l) for l in txt.splitlines() if l.strip()]
 
 
 @lru_cache(maxsize=1)

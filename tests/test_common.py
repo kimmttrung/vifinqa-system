@@ -1,5 +1,8 @@
 """Primitive dùng chung. Fixture cắt từ corpus thật, không bịa."""
-from common import fold, html_to_grid, parse_number, tokens
+import json
+
+import common
+from common import fold, html_to_grid, load_questions, parse_number, tokens
 
 
 class TestFold:
@@ -77,3 +80,29 @@ class TestHtmlToGrid:
 
 def test_tokens():
     assert tokens("Lợi nhuận sau thuế (60)") == ["LOI", "NHUAN", "SAU", "THUE", "60"]
+
+
+class TestLoadQuestions:
+    """Bộ đề rút gọn để chạy thử hay được xuất bằng json.dump(list) rồi đẩy lên
+    Kaggle Dataset, nên phải đọc được cả mảng JSON lẫn JSONL."""
+
+    ROWS = [{"id": 1, "question": "Doanh thu thuần năm 2023?"},
+            {"id": 2, "question": "Tổng tài sản cuối năm 2022?"}]
+
+    def _load(self, tmp_path, monkeypatch, name, text):
+        p = tmp_path / name
+        p.write_text(text, encoding="utf-8")
+        monkeypatch.setattr(common, "_resolve_questions", lambda: p)
+        return load_questions()
+
+    def test_jsonl(self, tmp_path, monkeypatch):
+        txt = "\n".join(json.dumps(r, ensure_ascii=False) for r in self.ROWS)
+        assert self._load(tmp_path, monkeypatch, "questions.jsonl", txt) == self.ROWS
+
+    def test_mang_json(self, tmp_path, monkeypatch):
+        txt = json.dumps(self.ROWS, ensure_ascii=False, indent=1)
+        assert self._load(tmp_path, monkeypatch, "questions.json", txt) == self.ROWS
+
+    def test_jsonl_co_dong_trong(self, tmp_path, monkeypatch):
+        txt = "\n\n".join(json.dumps(r, ensure_ascii=False) for r in self.ROWS) + "\n"
+        assert self._load(tmp_path, monkeypatch, "questions.jsonl", txt) == self.ROWS
