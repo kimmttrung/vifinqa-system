@@ -15,7 +15,6 @@ Stage G còn cắt tiếp `k_submit` xuống đúng những bảng mà pandas_qu
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -147,6 +146,38 @@ class Hit:
     line_no: object = None
     page_no: object = None
     char_start: object = None
+
+
+@lru_cache(maxsize=1)
+def _pos_index() -> dict:
+    """(doc_id, table_idx) → vị trí bảng, cho những bảng KHÔNG do retrieval trả về.
+
+    Fact table và solver trỏ thẳng vào table_idx mà retrieval có thể không xếp
+    hạng tới. Trước đây các bảng đó được dựng Hit rỗng, `line_no` = None, và
+    `emit.table_position` biến None thành **0** ⇒ ref `doc|0` trỏ vào chỗ không
+    tồn tại. Đo trên bài nộp đầy đủ: **119/6072 ref (1,96%) là `|0`** — mất
+    precision thuần tuý, không đổi lại được gì.
+    """
+    meta, *_ = _load()
+    out = {}
+    for row, d, t, ln, pg, cs, sec, cap in zip(
+            meta["row"], meta["doc_id"], meta["table_idx"], meta["line_no"],
+            meta["page_no"], meta["char_start"], meta["section"], meta["caption"]):
+        out[(d, int(t))] = (int(row), ln, pg, cs, sec, cap)
+    return out
+
+
+def hit_from_meta(doc_id: str, table_idx: int, score: float = 0.0,
+                  section: str = "OTHER", reasons: dict | None = None) -> Hit:
+    """Hit đầy đủ vị trí cho một bảng biết trước (fact-table / solver)."""
+    got = _pos_index().get((doc_id, int(table_idx)))
+    if got is None:
+        return Hit(row=-1, doc_id=doc_id, table_idx=int(table_idx), score=score,
+                   section=section, caption="", reasons=reasons or {})
+    row, ln, pg, cs, sec, cap = got
+    return Hit(row=row, doc_id=doc_id, table_idx=int(table_idx), score=score,
+               section=sec or section, caption=cap or "", reasons=reasons or {},
+               line_no=ln, page_no=pg, char_start=cs)
 
 
 def _section_hint(fq: str) -> set[str]:
@@ -319,8 +350,7 @@ def ce_extra_hits(ir: QueryIR, n: int, exclude: set[tuple[str, int]]) -> list[Hi
     return out
 
 
-def select_submit(hits: list[Hit], ir: QueryIR, k_max: int = 6,
-                  adaptive: bool = False) -> list[Hit]:
+def select_submit(hits: list[Hit], ir: QueryIR, k: int = 6) -> list[Hit]:
     """Chọn các bảng ghi vào `relevant_tables` — tối ưu F₂.
 
     ## Công thức đúng (không xấp xỉ), suy từ định nghĩa F₂
@@ -347,10 +377,12 @@ def select_submit(hits: list[Hit], ir: QueryIR, k_max: int = 6,
     Cả hai lần đều giả định "nộp toàn bảng ĐÚNG" rồi kết luận k nhỏ là tối ưu.
     Giả định đó chỉ đúng khi precision ≈ 1. Precision thật là 0.37, nên chi phí
     precision của việc nới k nhỏ hơn nhiều so với lợi ích recall (trọng số ×4).
+
+    `k` do người gọi quyết định — xem `adaptive_k()`.
     """
     if not hits:
         return []
-    k = adaptive_k(ir, k_max) if adaptive else k_max
+    k = max(1, int(k))
 
     # Ưu tiên phủ doc trước: câu nhiều công ty/năm mà dồn hết slot vào một doc
     # thì recall chết hẳn, không cứu được bằng bất kỳ k nào.
@@ -373,26 +405,99 @@ def select_submit(hits: list[Hit], ir: QueryIR, k_max: int = 6,
     return sel[:k]
 
 
-def adaptive_k(ir: QueryIR, k_max: int = 12) -> int:
+# Chỉ tiêu của hai vế thường nằm ở HAI báo cáo khác nhau (tỷ suất lợi nhuận =
+# KQKD ÷ CĐKT; tăng trưởng = cùng chỉ tiêu ở hai kỳ). Câu như vậy cần nhiều bảng
+# hơn trên mỗi document.
+_MULTI_METRIC_OPS = {"RATIO", "DIFF", "GROWTH"}
+TABLES_PER_DOC = 1.2            # đo gián tiếp: gold ≈ 2,7 bảng trên ≈ 2,27 doc
+TABLES_PER_DOC_MULTI = 1.8
+K_MULT = 2.5                    # k* = G/ρ với ρ = mật độ trúng ≈ 0,4 ở đầu bảng
+
+
+def n_targets(ir: QueryIR, n_docs: int | None = None) -> int:
+    """Số cặp (công ty × năm) mà câu hỏi thật sự chạm tới.
+
+    Cắt theo số doc ứng viên vì tích công ty × năm hay phóng đại: câu hỏi nêu
+    5 năm nhưng công ty chỉ có 3 báo cáo thì chỉ 3 cặp là có thật.
+    """
+    n = max(1, len(ir.tickers)) * max(1, len(ir.years))
+    return min(n, max(1, n_docs)) if n_docs else n
+
+
+def estimate_gold_tables(ir: QueryIR, n_docs: int | None = None) -> float:
+    """Ước lượng G — số bảng gold của RIÊNG câu này."""
+    per_doc = (TABLES_PER_DOC_MULTI if _MULTI_METRIC_OPS & set(ir.ops)
+               else TABLES_PER_DOC)
+    return per_doc * n_targets(ir, n_docs)
+
+
+def adaptive_k(ir: QueryIR, k_max: int = 12, n_docs: int | None = None,
+               mult: float = K_MULT) -> int:
     """Số bảng nộp, TÍNH RIÊNG cho từng câu.
 
-    `F₂ = 5h/(4G+k)` là công thức theo TỪNG CÂU, mà G thay đổi rất mạnh:
-    câu 1 công ty 1 năm có G≈1-2, câu 10 công ty × 3 năm có G≈10+. Dùng một
-    hằng số k cho cả hai là sai ở cả hai đầu — thừa với câu đơn (mất precision
-    vô ích), thiếu với câu nhóm (recall bị chặn cứng).
+    ## Vì sao không thể dùng một hằng số
 
-    Neo vào số đo thật: quét k phẳng cho ra đỉnh ở **k ≈ 7,5** trên toàn bộ
-    1.012 câu. Nên hàm này phải có TRUNG BÌNH ≈ 7 để không phá vỡ kết quả đã
-    đo, chỉ phân bổ lại: câu đơn bớt đi, câu nhóm nhiều hơn.
+    `F₂ = 5h/(4G+k)` là công thức theo TỪNG CÂU, mà G thay đổi rất mạnh. Đo trên
+    1.012 câu: **43,4% câu chỉ có ĐÚNG MỘT cặp (công ty × năm)**, trong khi p90
+    là 6 cặp và cao nhất là 18. Một hằng số k sai ở cả hai đầu:
 
-    Tăng theo **log** chứ không tuyến tính, vì G không tỷ lệ thuận với số
-    target: câu 10 công ty thường chỉ cần 1 bảng/công ty, còn câu 1 công ty vẫn
-    cần ~2 bảng (CĐKT bị tách đôi — Mục 3 §14 CLAUDE.md).
+        G=1, h→1:   k=3 ⇒ F₂ 0,71   ·  k=6 ⇒ 0,50  ·  k=10 ⇒ 0,36
+        G=6, h≈0,3k: k=6 ⇒ F₂ 0,30  ·  k=12 ⇒ 0,50 ·  k=18 ⇒ 0,64
 
-        n_targets:  1 → k=6 · 2 → k=6 · 4 → k=8 · 8 → k=9 · 20 → k=11
+    ## k tối ưu nằm ở điểm BÃO HOÀ
 
-    Đây vẫn là **giả thuyết chưa đo** — phải so với k=6 phẳng bằng một lượt nộp.
+    Mô hình h(k) = min(G, ρk) với ρ = mật độ trúng của bảng xếp hạng:
+
+        F₂ = 5ρk/(4G+k)   khi ρk < G   → TĂNG theo k
+        F₂ = 5G/(4G+k)    khi ρk ≥ G   → GIẢM theo k
+
+    ⇒ đỉnh đúng tại **k\\* = G/ρ**. Đo được ρ theo dải hạng (probe 17/08):
+
+        hạng 1-2: 0,368/bảng · hạng 3-6: 0,236 · hạng 7-10: 0,126
+
+    Lấy ρ ≈ 0,4 ở đầu bảng ⇒ hệ số 2,5.
+
+    ## Hiệu chuẩn: giữ nguyên TRUNG BÌNH đã đo, chỉ phân bổ lại
+
+    Quét k phẳng cho đỉnh ở **k ≈ 7,5**. Công thức này chạy trên 1.012 câu cho
+    **trung bình 7,43** — tức không phá vỡ điều duy nhất đã đo được, mà chuyển
+    slot từ câu đơn sang câu nhóm:
+
+        k=3: 367 câu · k=4: 72 · k=6: 28 · k=9: 191 · k=12: 354
+        43,4% câu nộp ÍT hơn 6 · 53,9% nộp NHIỀU hơn 6
+
+    Đây là **giả thuyết chưa đo trên leaderboard**. Nó thay đúng một biến so với
+    cấu hình `k6` (F₂ 0,4137) nên quy được nguyên nhân.
+
+    ## Cảnh báo cho lần sau
+    `--adaptive-k` bản trước là **no-op**: công thức `4 + 1,5·log₂(1+n)` có sàn
+    5,5 nên với `--k-max 6` mọi câu đều ra đúng 6. Cờ bật mà không đổi gì, không
+    có lỗi nào báo. Vì vậy hàm này có test kiểm chính chuyện đó.
     """
-    n_targets = max(1, len(ir.tickers)) * max(1, len(ir.years))
-    k = 4.0 + 1.5 * math.log2(1 + n_targets)
-    return int(max(3, min(k_max, round(k))))
+    g = estimate_gold_tables(ir, n_docs)
+    return int(max(2, min(k_max, round(mult * g))))
+
+
+DOCS_SLACK = 1                  # đệm cho doc filter bỏ sót
+
+
+def adaptive_docs(ir: QueryIR, cap: int = 8, n_docs: int | None = None) -> int:
+    """Số doc ghi vào `relevant_docs` — chấm RIÊNG với `relevant_tables`.
+
+    Khác hẳn bài toán bảng ở một điểm quyết định: **precision của doc rất cao**.
+    Đo 17/08 khi nộp 2,06 doc/câu: P = 0,932, R = 0,845. Doc thứ n mà ta thêm
+    vào gần như luôn là gold, nên ngưỡng đáng thêm
+
+        p > h/(4G + n) = 1,92/(4·2,27 + 2,06) = 0,17
+
+    bị vượt rất xa. Nghĩa là nộp thiếu doc là mất điểm gần như thuần tuý — chỉ
+    cần đừng nộp doc mà mình không có lý do gì để tin.
+
+    Nên: nộp theo số cặp (công ty × năm) cộng một đệm, chứ không phải hằng số 3.
+    Câu 1 công ty 1 năm nộp 2; câu 8 cặp nộp 9 — hằng số 3 chặn cứng recall của
+    nhóm sau, mà nhóm ấy là 29,8% bộ đề.
+    """
+    n = n_targets(ir, n_docs) + DOCS_SLACK
+    if n_docs:
+        n = min(n, n_docs)          # đừng bịa doc mà doc filter không đưa ra
+    return int(max(1, min(cap, n)))

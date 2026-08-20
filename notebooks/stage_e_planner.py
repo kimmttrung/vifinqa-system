@@ -103,7 +103,10 @@ N_FULL = 1012            # số câu của bộ đề đầy đủ — chỉ dù
 # df1..dfN của bài ở local. Lệch nhau thì code vẫn chạy, chỉ là đọc nhầm bảng —
 # sai mà không có lỗi nào báo. (Riêng `--ce-extra` chỉ NỐI vào cuối nên df1..df6
 # giữ nguyên, vá chéo được; `--ce-weight` thì đảo cả thứ tự, không vá chéo được.)
-BASE_ARGS = ["--k-max", "6", "--adaptive-k"]
+# k và số doc giờ TÍNH RIÊNG cho từng câu (retrieval.adaptive_k / adaptive_docs),
+# đây chỉ là TRẦN. `--adaptive-k` cũ đã bỏ vì nó là no-op: công thức có sàn 5,5
+# nên với `--k-max 6` mọi câu đều ra đúng 6 — cờ bật mà không đổi gì.
+BASE_ARGS = ["--k-max", "12", "--max-docs", "8"]
 
 # Trần RAM cho mỗi tiến trình chạy code của LLM (xem src/sandbox.py). 4 GB dư
 # sức cho những CSV vài trăm dòng ở đây; code nào vượt là code hỏng, không phải
@@ -242,6 +245,7 @@ if miss:
 
 from qparse import parse_question            # noqa: E402
 from sandbox import run_jobs                 # noqa: E402
+from llmcode import check as check_code      # noqa: E402
 from common import ARTIFACTS                 # noqa: E402
 
 OUT = Path("/kaggle/working") if IN_KAGGLE else Path("out/llm")
@@ -507,14 +511,17 @@ pending = [(rec, ir) for rec, ir in targets if rec["id"] not in patched]
 journal: list[dict] = []
 shrunk = Counter()
 
-for attempt, temp in enumerate([0.0, 0.35, 0.35]):
+TEMPS = [0.0, 0.35, 0.35]
+N_ATTEMPTS = len(TEMPS)
+
+for attempt, temp in enumerate(TEMPS):
     if not pending:
         break
     log(f"── lượt {attempt} (T={temp}) trên {len(pending)} câu ──")
     sp = SamplingParams(temperature=temp, top_p=0.95 if temp else 1.0,
                         max_tokens=800, seed=attempt,
                         stop=["```\n\n", "\n\n\n"])
-    still, n_ok, n_none, n_err = [], 0, 0, 0
+    still, n_ok, n_none, n_err, n_guard = [], 0, 0, 0, 0
 
     for start in range(0, len(pending), CHUNK):
         if time.time() - T_START > TIME_BUDGET_S:
@@ -542,24 +549,41 @@ for attempt, temp in enumerate([0.0, 0.35, 0.35]):
             gc.collect()
             continue
 
-        codes = [extract_code(o.outputs[0].text) for o in outs]
+        # Kiểm code TRƯỚC khi chạy: chặn số viết tay, rút `result = EXPR` về
+        # `EXPR`. Xem src/llmcode.py — cả hai lỗi này đều đã lọt vào bài nộp
+        # thử 20/08 mà không tầng kiểm nào cũ bắt được.
+        # Lượt cuối nới lỏng (nhận cả code nhiều lệnh): hết lượt retry rồi thì
+        # có còn hơn không.
+        checks = [check_code(extract_code(o.outputs[0].text),
+                             strict=attempt < N_ATTEMPTS - 1) for o in outs]
 
         # Ghi code thô TRƯỚC khi đem đi chạy. Thứ tự này là cả vấn đề: bước exec
         # là chỗ đã giết kernel ở giờ thứ 4,24 hôm 20/08. Sandbox giờ chặn được
         # cái chết đó, nhưng file này vẫn đáng có — mất kernel vì bất kỳ lý do
         # nào khác thì token đã sinh vẫn còn, replay lại trên CPU vài phút.
         append_jsonl(RAW_PATH, [
-            {"id": rec["id"], "attempt": attempt, "code": code,
+            {"id": rec["id"], "attempt": attempt, "code": ck.code, "form": ck.form,
+             "guard_ok": ck.ok, "guard_reason": ck.reason,
              "evidence": [e["csv_path"] for e in rec["evidence"]]}
-            for (rec, _ir), code in zip(keep, codes)])
+            for (rec, _ir), ck in zip(keep, checks)])
 
         # Chạy CẢ LÔ trong tiến trình con có trần RAM. Câu nào làm chết tiến
         # trình con thì chỉ mình nó bị loại, kernel notebook không hề hấn gì.
-        results = run_jobs(jobs_for([(rec, c) for (rec, _ir), c in zip(keep, codes)]),
+        results = run_jobs(jobs_for([(rec, ck.code) for (rec, _ir), ck in
+                                     zip(keep, checks) if ck.ok]),
                            BASE, mem_gb=SANDBOX_MEM_GB, timeout_s=8.0, log=log)
 
         new_patch, new_log = [], []
-        for (rec, ir), code in zip(keep, codes):
+        for (rec, ir), ck in zip(keep, checks):
+            code = ck.code
+            if not ck.ok:
+                n_guard += 1
+                shrunk[f"guard:{ck.form}"] += 1
+                still.append((rec, ir))
+                new_log.append({"id": rec["id"], "attempt": attempt,
+                                "status": "guard", "error": ck.reason,
+                                "code": code[:400]})
+                continue
             res = results.get(rec["id"])
             if res is not None and res.ok:
                 row = {
@@ -592,10 +616,10 @@ for attempt, temp in enumerate([0.0, 0.35, 0.35]):
         del outs, prompts, keep, codes, results, new_patch, new_log
         gc.collect()
         log(f"   lô {start//CHUNK + 1}/{-(-len(pending)//CHUNK)}: "
-            f"nhận {n_ok} · lỗi {n_err} · None {n_none} · RAM {ram_gb():.1f} GB")
+            f"nhận {n_ok} · lỗi {n_err} · None {n_none} · guard {n_guard} · RAM {ram_gb():.1f} GB")
 
     log(f"   lượt {attempt} xong: nhận {n_ok} · lỗi {n_err} · trả None {n_none} "
-        f"· còn lại {len(still)}")
+        f"· guard chặn {n_guard} · còn lại {len(still)}")
     if attempt == 0:
         log(f"   thu nhỏ prompt: {dict(shrunk.most_common())}")
     pending = still

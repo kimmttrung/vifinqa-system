@@ -30,7 +30,8 @@ from docfilter import filter_docs
 from execute import verify
 from grids import load_grids
 from qparse import parse_question
-from retrieval import Hit, ce_extra_hits, retrieve, select_submit
+from retrieval import (adaptive_docs, adaptive_k, ce_extra_hits, hit_from_meta,
+                       retrieve, select_submit)
 from solve import solve
 from submit import Record, Submission
 
@@ -47,8 +48,11 @@ def _hit_like(fh, hits):
     for h in hits:
         if h.doc_id == fh.doc_id and h.table_idx == fh.table_idx:
             return h
-    return Hit(row=-1, doc_id=fh.doc_id, table_idx=fh.table_idx, score=fh.score,
-               section=fh.statement, caption="", reasons={"src": "fact"})
+    # Tra vị trí từ table_meta thay vì để trống: Hit rỗng cho line_no = None,
+    # emit biến nó thành 0, và `doc|0` là ref chắc chắn sai (1,96% ref của bài
+    # nộp trước rơi vào đây).
+    return hit_from_meta(fh.doc_id, fh.table_idx, score=fh.score,
+                         section=fh.statement, reasons={"src": "fact"})
 
 
 def _write_trace(out_dir: Path, plans, sub, args) -> Path:
@@ -75,7 +79,7 @@ def _write_trace(out_dir: Path, plans, sub, args) -> Path:
         raise TypeError(type(o).__name__)
 
     with p.open("w", encoding="utf-8") as f:
-        for ir, docs, hits, sel, fhits, sol, cex in plans:
+        for ir, docs, hits, sel, fhits, sol, cex, k, n_docs_sub in plans:
             rec = by_id.get(ir.qid)
             selected = {(h.doc_id, h.table_idx) for h in sel}
             row = {
@@ -144,24 +148,31 @@ def build(args) -> int:
     for n, q in enumerate(questions, 1):
         ir = parse_question(q["id"], q["question"])
         docs = filter_docs(ir)
+        # k và số doc TÍNH RIÊNG cho từng câu: 43,4% câu chỉ có một cặp
+        # (công ty × năm) và cần ít bảng, trong khi p90 là 6 cặp. Xem
+        # retrieval.adaptive_k() cho suy luận và số hiệu chuẩn.
+        k = args.flat_k or adaptive_k(ir, args.k_max, len(docs), mult=args.k_mult)
+        n_docs_sub = args.flat_docs or adaptive_docs(ir, args.max_docs, len(docs))
         # Router: thử fact-table trước. Nó tra trên MỌI bảng của doc nên không
         # phụ thuộc thứ hạng BM25 — trượt ở đây mới rơi xuống retrieval.
-        fhits = factlookup.lookup(ir, top=args.k_max) if use_facts else []
-        hits = retrieve(ir, k_read=args.k_read, candidate_docs=docs)
-        sel = select_submit(hits, ir, k_max=args.k_max, adaptive=args.adaptive_k)
+        fhits = factlookup.lookup(ir, top=k) if use_facts else []
+        # đọc rộng hơn số nộp: cell grounding cần ứng viên, và select_submit
+        # còn phải ưu tiên phủ doc trước khi lấp theo điểm.
+        hits = retrieve(ir, k_read=max(args.k_read, k + 4), candidate_docs=docs)
+        sel = select_submit(hits, ir, k)
         # solve() phải chạy ở ĐÂY chứ không ở pha sau: nó tham chiếu những bảng
         # mà retrieval có thể không trả về, và pha nạp lưới cần biết trước.
         sol = solve(ir) if (use_facts and not args.no_solver) else None
         cex = ce_extra_hits(ir, args.ce_extra,
                             {(h.doc_id, h.table_idx) for h in sel})
-        plans.append((ir, docs, hits, sel, fhits, sol, cex))
+        plans.append((ir, docs, hits, sel, fhits, sol, cex, k, n_docs_sub))
         if n % 100 == 0:
             print(f"    {n}/{len(questions)} · {time.time()-t0:.0f}s", flush=True)
 
     # nạp lưới cho cả các bảng CHỈ dùng để dò ô (hạng 2,3…) chứ không nộp:
     # relevant_tables tối ưu F₂ nên hẹp, còn cell grounding cần rộng.
     keys = {(h.doc_id, h.table_idx)
-            for _, _, hits, sel, fh, sol, cex in plans
+            for _, _, hits, sel, fh, sol, cex, _k, _nd in plans
             for h in (list(hits[:args.k_probe]) + list(sel) + list(fh) + list(cex)
                       + (list(sol.facts) if sol else []))}
     print(f"[2/4] nạp lưới cho {len(keys)} bảng…", flush=True)
@@ -179,7 +190,7 @@ def build(args) -> int:
             written[key] = name
         return f"data/{written[key]}"
 
-    for ir, docs, hits, sel, fhits, sol, cex in plans:
+    for ir, docs, hits, sel, fhits, sol, cex, k, n_docs_sub in plans:
         if not sel and not fhits:
             stats["no_hit"] += 1
             sub.add(Record(id=ir.qid, question=ir.question, answer=0.0,
@@ -212,7 +223,7 @@ def build(args) -> int:
                                                     args.doc_id_scheme))
                         extra_docs.append(h.doc_id)
                     for h in hits:                      # lấp cho đủ k_max
-                        if len(seen) >= args.k_max:
+                        if len(seen) >= k:
                             break
                         if (h.doc_id, h.table_idx) not in seen:
                             seen[(h.doc_id, h.table_idx)] = h
@@ -230,7 +241,7 @@ def build(args) -> int:
                     sub.add(Record(
                         id=ir.qid, question=ir.question, answer=float(sol.value),
                         relevant_docs=[emit.doc_ref(d, args.doc_id_scheme)
-                                       for d in ranked[:args.max_docs]],
+                                       for d in ranked[:n_docs_sub]],
                         relevant_tables=refs, evidence=ev, pandas_query=sol.code))
                     stats[f"solve_{sol.kind}"] += 1
                     stats["verified"] += 1
@@ -279,7 +290,7 @@ def build(args) -> int:
             # đúng kỳ) — bằng chứng mạnh hơn hạng 1 của BM25. Khi chỉ cần 1 bảng
             # thì thay hẳn, đừng nộp 2 (k=1 F₂ 1.000 vs k=2 F₂ 0.833).
             submit_hits = ([extra] if len(submit_hits) <= 1
-                           else [extra] + submit_hits[:args.k_max - 1])
+                           else [extra] + submit_hits[:k - 1])
         else:
             submit_hits = ([h for h in submit_hits
                             if extra and h.doc_id == extra.doc_id and h.table_idx == extra.table_idx]
@@ -312,7 +323,7 @@ def build(args) -> int:
         for d in docs:                       # doc filter lo phần retrieval bỏ sót
             if d not in ranked:
                 ranked.append(d)
-        docs_used = [emit.doc_ref(d, args.doc_id_scheme) for d in ranked[:args.max_docs]]
+        docs_used = [emit.doc_ref(d, args.doc_id_scheme) for d in ranked[:n_docs_sub]]
 
         if found and evidence:
             mult = unit_scale / (1.0 if ir.unit_kind in _NON_VND else ir.unit_scale)
@@ -340,7 +351,9 @@ def build(args) -> int:
     zpath = sub.zip()
     (out_dir / "run_meta.json").write_text(json.dumps({
         "tag": args.tag, "position_scheme": args.position_scheme,
-        "doc_id_scheme": args.doc_id_scheme, "k_read": args.k_read, "k_max": args.k_max,
+        "doc_id_scheme": args.doc_id_scheme, "k_read": args.k_read,
+        "k_max": args.k_max, "k_mult": args.k_mult, "flat_k": args.flat_k,
+        "max_docs": args.max_docs, "flat_docs": args.flat_docs,
         "n_questions": len(questions), "stats": dict(stats),
         "n_csv": len(list(sub.data_dir.glob("*.csv"))), "n_pruned": n_pruned,
         "validation_errors": errs[:50], "seconds": round(time.time() - t0, 1),
@@ -364,15 +377,25 @@ def main() -> int:
                     help="số bảng retrieval trả về (tối ưu recall)")
     ap.add_argument("--k-probe", type=int, default=6,
                     help="số bảng đem đi dò ô đáp án")
-    ap.add_argument("--k-max", type=int, default=6,
-                    help="số bảng ghi vào relevant_tables. F₂ = 5h/(4G+k) với "
-                         "G≈2.15, h≈0.37k ⇒ tối ưu quanh k=6-8, xem select_submit()")
-    ap.add_argument("--max-docs", type=int, default=3,
-                    help="số doc ghi vào relevant_docs (chấm riêng với relevant_tables)")
+    ap.add_argument("--k-max", type=int, default=12,
+                    help="TRẦN số bảng/câu. Số thật do adaptive_k() tính riêng "
+                         "cho từng câu (trung bình 7,43 — bằng đỉnh đã đo của k phẳng)")
+    ap.add_argument("--k-mult", type=float, default=2.5,
+                    help="k = mult × G_ước_lượng. 2.5 suy từ k* = G/ρ với ρ≈0,4")
+    ap.add_argument("--flat-k", type=int, default=0,
+                    help="ép k cố định cho MỌI câu — chỉ để tái lập cấu hình cũ "
+                         "(--flat-k 6 = bài `k6` F₂ 0,4137) khi so A/B")
+    ap.add_argument("--max-docs", type=int, default=8,
+                    help="TRẦN số doc/câu. Số thật do adaptive_docs() tính riêng")
+    ap.add_argument("--flat-docs", type=int, default=0,
+                    help="ép số doc cố định — tái lập cấu hình cũ (--flat-docs 3)")
     ap.add_argument("--no-facts", action="store_true", help="tắt fast-path fact-table")
     ap.add_argument("--no-solver", action="store_true", help="tắt bộ giải đa ô (ablation)")
+    # `--adaptive-k` cũ đã BỎ: nó là no-op. Công thức 4+1,5·log₂(1+n) có sàn 5,5
+    # nên với --k-max 6 mọi câu vẫn ra đúng 6. Giờ adaptive là mặc định, muốn
+    # quay lại hằng số thì dùng --flat-k.
     ap.add_argument("--adaptive-k", action="store_true",
-                    help="k theo từng câu (log2 số target) thay vì k_max phẳng")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--trace", action="store_true",
                     help="ghi out/<tag>/trace.jsonl — mọi tín hiệu retrieval/rerank/RRF")
     ap.add_argument("--fact-threshold", type=float, default=0.55,
